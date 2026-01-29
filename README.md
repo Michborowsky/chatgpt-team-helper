@@ -1,4 +1,4 @@
-# Team Helper
+# ChatGPT Team Helper
 <img width="3840" height="1920" alt="image" src="https://github.com/user-attachments/assets/e5fcd950-7844-4ff7-be00-28246024a847" />
 
 <img width="3840" height="1922" alt="image" src="https://github.com/user-attachments/assets/06e169e2-dfd3-4324-82ef-950bc96102c8" />
