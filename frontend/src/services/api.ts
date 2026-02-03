@@ -293,6 +293,19 @@ export interface CreateGptAccountDto {
   expireAt?: string
 }
 
+export interface ChatgptAccountCheckInfo {
+  accountId: string
+  name: string
+  planType: string | null
+  expiresAt: string | null
+  hasActiveSubscription: boolean
+  isDemoted: boolean
+}
+
+export interface CheckGptAccessTokenResponse {
+  accounts: ChatgptAccountCheckInfo[]
+}
+
 export interface ChatgptAccountUser {
   id: string
   account_user_id?: string
@@ -1337,6 +1350,11 @@ export const gptAccountService = {
 
   async delete(id: number): Promise<void> {
     await api.delete(`/gpt-accounts/${id}`)
+  },
+
+  async checkAccessToken(token: string): Promise<CheckGptAccessTokenResponse> {
+    const response = await api.post('/gpt-accounts/check-token', { token })
+    return response.data
   },
 
   async syncUserCount(id: number): Promise<SyncUserCountResponse> {
