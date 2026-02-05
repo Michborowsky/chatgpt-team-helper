@@ -122,6 +122,23 @@ router.get('/overview', async (req, res) => {
           AND DATE(created_at) = DATE('now', 'localtime')
       `
     )
+    const commonCodesTodayTotal = scalar(
+      `
+        SELECT COUNT(*)
+        FROM redemption_codes
+        WHERE COALESCE(NULLIF(TRIM(channel), ''), 'common') = 'common'
+          AND DATE(created_at) = DATE('now', 'localtime')
+      `
+    )
+    const commonCodesTodayUnused = scalar(
+      `
+        SELECT COUNT(*)
+        FROM redemption_codes
+        WHERE COALESCE(NULLIF(TRIM(channel), ''), 'common') = 'common'
+          AND COALESCE(is_redeemed, 0) = 0
+          AND DATE(created_at) = DATE('now', 'localtime')
+      `
+    )
 
     const codesByChannelResult = db.exec(
       `
@@ -298,6 +315,10 @@ router.get('/overview', async (req, res) => {
         total: codesTotal,
         unused: codesUnused,
         byChannel: codesByChannel,
+        todayCommon: {
+          total: commonCodesTodayTotal,
+          unused: commonCodesTodayUnused,
+        },
         todayXhs: {
           total: xhsCodesTodayTotal,
           unused: xhsCodesTodayUnused,

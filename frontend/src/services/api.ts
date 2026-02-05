@@ -1822,6 +1822,7 @@ export interface AdminStatsOverviewResponse {
     total: number
     unused: number
     byChannel: Array<{ channel: string; total: number; unused: number }>
+    todayCommon: { total: number; unused: number }
     todayXhs: { total: number; unused: number }
     todayXianyu: { total: number; unused: number }
   }
