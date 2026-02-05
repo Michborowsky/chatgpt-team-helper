@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-IMAGE_NAME="${IMAGE_NAME:-ghcr.io/axinhouzilaoyue/chatgpt-team-helper}"
+IMAGE_NAME="${IMAGE_NAME:-ghcr.io/kylsky/chatgpt-team-helper}"
 TAG="${TAG:-latest}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 PUSH="${PUSH:-false}"
