@@ -277,9 +277,11 @@ onMounted(async () => {
 
           <Card class="rounded-2xl border-gray-100">
             <CardContent class="p-5 space-y-2">
-              <p class="text-xs font-semibold text-gray-400 uppercase tracking-wider">提现待处理</p>
-              <p class="text-2xl font-bold text-gray-900">{{ formatNumber(overview.pointsWithdrawals.pending) }}</p>
-              <p class="text-xs text-gray-500">{{ formatNumber(overview.pointsWithdrawals.pendingPoints) }} 积分 · ¥{{ formatMoney(overview.pointsWithdrawals.pendingCash) }}</p>
+              <p class="text-xs font-semibold text-gray-400 uppercase tracking-wider">支付订单今日</p>
+              <p class="text-2xl font-bold text-gray-900">{{ formatNumber(overview.purchaseOrders.today.pending) }}</p>
+              <p class="text-xs text-gray-500">
+                待支付（今日总 {{ formatNumber(overview.purchaseOrders.today.total) }} · 已付 {{ formatNumber(overview.purchaseOrders.today.paid) }}）
+              </p>
             </CardContent>
           </Card>
 
@@ -296,6 +298,16 @@ onMounted(async () => {
               <p class="text-xs font-semibold text-gray-400 uppercase tracking-wider">闲鱼订单今日</p>
               <p class="text-2xl font-bold text-gray-900">{{ formatNumber(overview.xianyuOrders.today.pending) }}</p>
               <p class="text-xs text-gray-500">待核销（今日总 {{ formatNumber(overview.xianyuOrders.today.total) }}）</p>
+            </CardContent>
+          </Card>
+
+          <Card class="rounded-2xl border-gray-100">
+            <CardContent class="p-5 space-y-2">
+              <p class="text-xs font-semibold text-gray-400 uppercase tracking-wider">提现待处理</p>
+              <p class="text-2xl font-bold text-gray-900">{{ formatNumber(overview.pointsWithdrawals.pending) }}</p>
+              <p class="text-xs text-gray-500">
+                {{ formatNumber(overview.pointsWithdrawals.pendingPoints) }} 积分 · ¥{{ formatMoney(overview.pointsWithdrawals.pendingCash) }}
+              </p>
             </CardContent>
           </Card>
         </div>

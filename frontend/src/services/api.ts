@@ -1853,6 +1853,14 @@ export interface AdminStatsOverviewResponse {
     refunded: number
     paidAmount: number
     refundAmount: number
+    today: {
+      total: number
+      paid: number
+      pending: number
+      refunded: number
+      paidAmount: number
+      refundAmount: number
+    }
   }
   creditOrders: {
     total: number

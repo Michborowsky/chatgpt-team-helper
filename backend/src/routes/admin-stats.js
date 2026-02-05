@@ -264,6 +264,33 @@ router.get('/overview', async (req, res) => {
       [from, to]
     )
 
+    const purchaseOrdersTodayTotal = scalar(
+      `SELECT COUNT(*) FROM purchase_orders WHERE DATE(created_at) = DATE('now', 'localtime')`
+    )
+    const purchaseOrdersTodayPaid = scalar(
+      `SELECT COUNT(*) FROM purchase_orders WHERE status = 'paid' AND DATE(created_at) = DATE('now', 'localtime')`
+    )
+    const purchaseOrdersTodayPending = scalar(
+      `SELECT COUNT(*) FROM purchase_orders WHERE status IN ('created', 'pending_payment') AND DATE(created_at) = DATE('now', 'localtime')`
+    )
+    const purchaseOrdersTodayRefunded = scalar(
+      `SELECT COUNT(*) FROM purchase_orders WHERE status = 'refunded' AND DATE(created_at) = DATE('now', 'localtime')`
+    )
+    const purchaseOrdersTodayPaidAmount = sumAmount(
+      `
+        SELECT COALESCE(SUM(CASE WHEN status = 'paid' THEN CAST(amount AS REAL) ELSE 0 END), 0)
+        FROM purchase_orders
+        WHERE DATE(created_at) = DATE('now', 'localtime')
+      `
+    )
+    const purchaseOrdersTodayRefundAmount = sumAmount(
+      `
+        SELECT COALESCE(SUM(CASE WHEN status = 'refunded' THEN CAST(COALESCE(refund_amount, amount) AS REAL) ELSE 0 END), 0)
+        FROM purchase_orders
+        WHERE DATE(created_at) = DATE('now', 'localtime')
+      `
+    )
+
     const creditOrdersTotal = scalar(
       `SELECT COUNT(*) FROM credit_orders WHERE DATE(created_at) BETWEEN DATE(?) AND DATE(?)`,
       [from, to]
@@ -363,6 +390,14 @@ router.get('/overview', async (req, res) => {
         refunded: purchaseOrdersRefunded,
         paidAmount: purchaseOrdersPaidAmount,
         refundAmount: purchaseOrdersRefundAmount,
+        today: {
+          total: purchaseOrdersTodayTotal,
+          paid: purchaseOrdersTodayPaid,
+          pending: purchaseOrdersTodayPending,
+          refunded: purchaseOrdersTodayRefunded,
+          paidAmount: purchaseOrdersTodayPaidAmount,
+          refundAmount: purchaseOrdersTodayRefundAmount,
+        }
       },
       creditOrders: {
         total: creditOrdersTotal,
