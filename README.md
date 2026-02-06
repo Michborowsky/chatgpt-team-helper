@@ -1,12 +1,17 @@
 # ChatGPT Team Helper
-<img width="3840" height="1920" alt="image" src="https://github.com/user-attachments/assets/e5fcd950-7844-4ff7-be00-28246024a847" />
-
-<img width="3840" height="1922" alt="image" src="https://github.com/user-attachments/assets/06e169e2-dfd3-4324-82ef-950bc96102c8" />
+[![Telegram 交流群](https://img.shields.io/badge/Telegram-交流群-blue?logo=telegram)](https://t.me/+W7iplSdBGXhlMDc1)
+[![Linux DO](https://img.shields.io/badge/Linux%20DO-Yelo-green?logo=discourse)](https://linux.do/u/yelo/summary)
 
 一个多渠道 Team 账号管理与兑换平台，支持多种订单渠道接入、自动发货、积分体系和权限管理。使用 Vue 3、Node.js、shadcn-vue 和 SQLite 构建。
 
-[![Telegram 交流群](https://img.shields.io/badge/Telegram-交流群-blue?logo=telegram)](https://t.me/+W7iplSdBGXhlMDc1)
-[![Linux DO](https://img.shields.io/badge/Linux%20DO-Yelo-green?logo=discourse)](https://linux.do/u/yelo/summary)
+<img width="3840" height="1920" alt="image" src="https://github.com/user-attachments/assets/e5fcd950-7844-4ff7-be00-28246024a847" />
+
+<img width="3840" height="1926" alt="image" src="https://github.com/user-attachments/assets/5d8f4107-71ed-46c7-86c5-46cb02dfacbc" />
+
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Kylsky/chatgpt-team-helper&type=Date)](https://star-history.com/#Kylsky/chatgpt-team-helper&Date)
 
 ## 功能特性
 
