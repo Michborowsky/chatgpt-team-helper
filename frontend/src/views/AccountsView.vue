@@ -1380,6 +1380,7 @@ const handleInviteSubmit = async () => {
 	              <tr class="border-b border-gray-100 bg-gray-50/50">
 	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">ID</th>
 	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">邮箱</th>
+	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">状态</th>
 	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">已加入</th>
 	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">待加入</th>
 	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">过期时间</th>
@@ -1407,15 +1408,17 @@ const handleInviteSubmit = async () => {
                           >
                             {{ account.email }}
                           </span>
-                          <span
-                            class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
-                            :class="statusBadge(getAccountListStatus(account)).class"
-                          >
-                            {{ statusBadge(getAccountListStatus(account)).label }}
-                          </span>
                         </div>
                       </div>
 	                  </div>
+	                </td>
+	                <td class="px-6 py-5 text-center">
+	                  <span
+	                    class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
+	                    :class="statusBadge(getAccountListStatus(account)).class"
+	                  >
+	                    {{ statusBadge(getAccountListStatus(account)).label }}
+	                  </span>
 	                </td>
                 <td class="px-6 py-5 text-center">
                   <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-100">
@@ -1514,23 +1517,25 @@ const handleInviteSubmit = async () => {
                     <p class="text-sm font-bold break-all" :class="account.isBanned ? 'text-red-600' : 'text-gray-900'">{{ account.email }}</p>
                     <div class="mt-1 flex flex-wrap items-center gap-2">
                       <p class="text-xs text-blue-500 font-medium">#{{ account.id }}</p>
-                      <span
-                        class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
-                        :class="statusBadge(getAccountListStatus(account)).class"
-                      >
-                        {{ statusBadge(getAccountListStatus(account)).label }}
-                      </span>
                     </div>
                  </div>
               </div>
-              <div class="flex flex-wrap justify-end gap-2">
-                 <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-100">
+              <div class="flex flex-col items-end gap-2">
+                <span
+                  class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
+                  :class="statusBadge(getAccountListStatus(account)).class"
+                >
+                  {{ statusBadge(getAccountListStatus(account)).label }}
+                </span>
+                <div class="flex flex-wrap justify-end gap-2">
+                  <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-100">
                     {{ account.userCount }} 人
-                 </span>
-	                 <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold bg-purple-50 text-purple-600 border border-purple-100">
-	                    {{ account.inviteCount ?? 0 }} 待
-	                 </span>
-	              </div>
+                  </span>
+                  <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold bg-purple-50 text-purple-600 border border-purple-100">
+                    {{ account.inviteCount ?? 0 }} 待
+                  </span>
+                </div>
+              </div>
 	            </div>
 
             <div class="grid grid-cols-2 gap-4 text-xs text-gray-500 mb-4 bg-gray-50/50 p-3 rounded-xl">
