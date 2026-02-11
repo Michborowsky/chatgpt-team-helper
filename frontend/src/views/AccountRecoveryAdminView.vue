@@ -6,6 +6,7 @@ import {
   accountRecoveryAdminService,
   type AccountRecoveryBannedAccountSummary,
   type AccountRecoveryBannedAccountRedeem,
+  type AccountRecoveryRedeemSource,
   type AccountRecoveryLogRecord,
 } from '@/services/api'
 import { formatShanghaiDate } from '@/lib/datetime'
@@ -51,6 +52,17 @@ const accountsLoading = ref(false)
 const accountsError = ref('')
 const accountsSearch = ref('')
 const accountsFilter = ref<'all' | 'pending'>('all')
+type AccountRecoverySourceFilter = Exclude<AccountRecoveryRedeemSource, ''>
+const sourceOptions: Array<{ value: AccountRecoverySourceFilter; label: string }> = [
+  { value: 'payment', label: '支付订单' },
+  { value: 'credit', label: '积分订单' },
+  { value: 'xianyu', label: '闲鱼' },
+  { value: 'xhs', label: '小红书' },
+  { value: 'manual', label: '手动' },
+]
+const selectedSources = ref<AccountRecoverySourceFilter[]>(sourceOptions.map(item => item.value))
+const selectedSourcesParam = computed(() => selectedSources.value.join(','))
+const selectedSourcesKey = computed(() => [...selectedSources.value].slice().sort().join(','))
 const accountsPagination = ref({ page: 1, pageSize: 8, total: 0 })
 
 const selectedAccountId = ref<number | null>(null)
@@ -101,6 +113,16 @@ const channelLabel = (channel?: string) => {
   return normalized || '-'
 }
 
+const sourceLabel = (source?: string) => {
+  const normalized = String(source || '').trim()
+  if (normalized === 'payment') return '支付订单'
+  if (normalized === 'credit') return '积分订单'
+  if (normalized === 'xianyu') return '闲鱼'
+  if (normalized === 'xhs') return '小红书'
+  if (normalized === 'manual') return '手动'
+  return normalized || '-'
+}
+
 const stateLabel = (state: string) => {
   if (state === 'done') return '已完成'
   if (state === 'failed') return '失败'
@@ -123,6 +145,7 @@ const stateClass = (state: string) => {
 	      search: accountsSearch.value.trim() || undefined,
 	      days: daysNumber.value,
 	      pendingOnly: accountsFilter.value === 'pending' ? true : undefined,
+	      sources: selectedSourcesParam.value,
 	    })
 	    const nextAccounts = response.accounts || []
 	    accounts.value = nextAccounts
@@ -176,6 +199,7 @@ const loadRedeems = async () => {
       search: redeemsSearch.value.trim() || undefined,
       status: redeemsStatus.value,
       days: daysNumber.value,
+      sources: selectedSourcesParam.value,
     })
     redeems.value = response.redeems || []
     redeemsPagination.value = response.pagination || { page: 1, pageSize: 5, total: 0 }
@@ -213,6 +237,14 @@ const goToAccountsPage = (page: number) => {
 watch(accountsFilter, () => {
   accountsPagination.value.page = 1
   loadAccounts()
+})
+
+watch(selectedSourcesKey, async () => {
+  accountsPagination.value.page = 1
+  redeemsPagination.value.page = 1
+  selectedOriginalCodeIds.value = []
+  await loadAccounts()
+  await loadRedeems()
 })
 
 const handleRedeemsSearch = () => {
@@ -371,9 +403,9 @@ const reloadAll = async () => {
 </script>
 
 <template>
-  <div class="space-y-6">
+	  <div class="space-y-6">
 	    <Teleport v-if="teleportReady" to="#header-actions">
-	      <div class="flex items-center gap-3">
+	      <div class="flex items-center gap-3 flex-wrap justify-end">
 	        <Button
 	          variant="outline"
 	          class="rounded-xl"
@@ -381,7 +413,7 @@ const reloadAll = async () => {
 	          @click="reloadAll"
 	        >
 	          <RefreshCw class="w-4 h-4 mr-2" />
-	          刷新
+	          刷新列表
 	        </Button>
 	        <Button
 	          variant="outline"
@@ -448,6 +480,23 @@ const reloadAll = async () => {
                 <SelectItem value="pending">仍有待处理</SelectItem>
               </SelectContent>
             </Select>
+          </div>
+
+          <div class="mt-4 flex flex-wrap items-center gap-3">
+            <span class="text-xs font-medium text-gray-500">来源</span>
+            <label
+              v-for="item in sourceOptions"
+              :key="item.value"
+              class="inline-flex items-center gap-2 text-xs text-gray-700 select-none"
+            >
+              <input
+                v-model="selectedSources"
+                type="checkbox"
+                class="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                :value="item.value"
+              />
+              <span>{{ item.label }}</span>
+            </label>
           </div>
         </div>
 
@@ -580,8 +629,8 @@ const reloadAll = async () => {
                     @change="toggleSelectAllCurrentPage"
                   />
                 </th>
-                <th class="px-4 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">原码ID</th>
                 <th class="px-4 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">兑换码</th>
+                <th class="px-4 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">来源</th>
                 <th class="px-4 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">渠道</th>
                 <th class="px-4 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">用户邮箱</th>
                 <th class="px-4 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">兑换时间</th>
@@ -605,8 +654,8 @@ const reloadAll = async () => {
                     @change="toggleSelect(redeem.originalCodeId)"
                   />
                 </td>
-                <td class="px-4 py-4 text-sm font-medium text-blue-500">#{{ redeem.originalCodeId }}</td>
                 <td class="px-4 py-4 text-sm text-gray-900 font-mono">{{ redeem.code }}</td>
+                <td class="px-4 py-4 text-sm text-gray-600">{{ sourceLabel(redeem.source) }}</td>
                 <td class="px-4 py-4 text-sm text-gray-600">{{ channelLabel(redeem.channel) }}</td>
                 <td class="px-4 py-4 text-sm text-gray-900">{{ redeem.userEmail }}</td>
                 <td class="px-4 py-4 text-sm text-gray-600">
