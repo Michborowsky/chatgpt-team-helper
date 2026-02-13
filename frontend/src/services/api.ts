@@ -1496,6 +1496,24 @@ export interface AccountRecoveryBannedAccountProcessedResponse {
   }
 }
 
+export interface AccountRecoveryOneClickPreviewParams {
+  source: Exclude<AccountRecoveryRedeemSource, ''>
+  days?: number
+  limit?: number
+}
+
+export interface AccountRecoveryOneClickPreviewResponse {
+  source: Exclude<AccountRecoveryRedeemSource, ''>
+  days: number
+  pendingCount: number
+  failedCount: number
+  needCount: number
+  availableCount: number
+  willProcessCount: number
+  originalCodeIds: number[]
+  generatedAt: string
+}
+
 export const accountRecoveryAdminService = {
   async listBannedAccounts(params?: AccountRecoveryBannedAccountsListParams): Promise<AccountRecoveryBannedAccountsResponse> {
     const response = await api.get('/admin/account-recovery/banned-accounts', { params })
@@ -1512,6 +1530,11 @@ export const accountRecoveryAdminService = {
 
   async getLogs(originalCodeId: number): Promise<AccountRecoveryLogsResponse> {
     const response = await api.get('/admin/account-recovery/logs', { params: { originalCodeId } })
+    return response.data
+  },
+
+  async oneClickPreview(params: AccountRecoveryOneClickPreviewParams): Promise<AccountRecoveryOneClickPreviewResponse> {
+    const response = await api.get('/admin/account-recovery/one-click/preview', { params })
     return response.data
   },
 

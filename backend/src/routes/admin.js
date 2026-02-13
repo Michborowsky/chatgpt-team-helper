@@ -2600,6 +2600,248 @@ router.get('/account-recovery/logs', async (req, res) => {
   }
 })
 
+router.get('/account-recovery/one-click/preview', async (req, res) => {
+  try {
+    const source = String(req.query.source || '').trim().toLowerCase()
+    if (!ACCOUNT_RECOVERY_SOURCE_SET.has(source)) {
+      return res.status(400).json({ error: 'Invalid source' })
+    }
+
+    const days = Math.max(1, Math.min(90, toInt(req.query.days, ACCOUNT_RECOVERY_WINDOW_DAYS)))
+    const limit = Math.min(200, Math.max(1, toInt(req.query.limit, 200)))
+    const threshold = `-${days} days`
+
+    const db = await getDatabase()
+
+    // Best-effort inventory count (common channel only); actual recovery may still fail due to per-order expiry requirements.
+    const capacityLimit = 6
+    const availableResult = db.exec(
+      `
+        SELECT COUNT(*)
+        FROM redemption_codes rc
+        JOIN gpt_accounts ga ON lower(ga.email) = lower(rc.account_email)
+        WHERE rc.is_redeemed = 0
+          AND rc.account_email IS NOT NULL
+          AND trim(rc.account_email) != ''
+          AND COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
+          AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+          AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+          AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
+          AND COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0) < ?
+          AND COALESCE(ga.is_open, 0) = 1
+          AND COALESCE(ga.is_banned, 0) = 0
+          AND ga.token IS NOT NULL
+          AND trim(ga.token) != ''
+          AND ga.chatgpt_account_id IS NOT NULL
+          AND trim(ga.chatgpt_account_id) != ''
+          AND ga.expire_at IS NOT NULL
+          AND trim(ga.expire_at) != ''
+          AND DATETIME(REPLACE(ga.expire_at, '/', '-')) >= DATETIME('now', 'localtime')
+      `,
+      [capacityLimit]
+    )
+    const availableCount = Number(availableResult[0]?.values?.[0]?.[0] || 0)
+
+    const eligibilitySql = `
+      WITH log_flags AS (
+        SELECT
+          original_code_id,
+          COUNT(*) AS attempts,
+          MAX(id) AS latest_id
+        FROM account_recovery_logs
+        GROUP BY original_code_id
+      ),
+      log_latest AS (
+        SELECT
+          ar.original_code_id,
+          ar.status
+        FROM account_recovery_logs ar
+        JOIN log_flags lf ON lf.latest_id = ar.id
+      ),
+      completed_flags AS (
+        SELECT
+          original_code_id,
+          MAX(id) AS latest_completed_id
+        FROM account_recovery_logs
+        WHERE status IN ('success', 'skipped')
+        GROUP BY original_code_id
+      ),
+      completed_latest AS (
+        SELECT
+          ar.original_code_id,
+          ar.recovery_account_email
+        FROM account_recovery_logs ar
+        JOIN completed_flags cf ON cf.latest_completed_id = ar.id
+      ),
+      eligible_codes AS (
+        SELECT
+          ga.id AS account_id,
+          rc.id AS original_code_id,
+          rc.redeemed_at AS redeemed_at,
+          rc.account_email AS original_account_email,
+          CASE
+            WHEN EXISTS (
+              SELECT 1
+              FROM purchase_orders po
+              WHERE (po.code_id = rc.id OR (po.code_id IS NULL AND po.code = rc.code))
+                AND po.created_at >= DATETIME('now', 'localtime', ?)
+                AND po.refunded_at IS NULL
+                AND COALESCE(po.status, '') != 'refunded'
+            ) THEN 'payment'
+            WHEN EXISTS (
+              SELECT 1
+              FROM credit_orders co
+              WHERE (co.code_id = rc.id OR (co.code_id IS NULL AND co.code = rc.code))
+                AND co.created_at >= DATETIME('now', 'localtime', ?)
+                AND co.refunded_at IS NULL
+                AND COALESCE(co.status, '') != 'refunded'
+            ) THEN 'credit'
+            WHEN EXISTS (
+              SELECT 1
+              FROM xianyu_orders xo
+              WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+                AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+            ) THEN 'xianyu'
+            WHEN EXISTS (
+              SELECT 1
+              FROM xhs_orders xo
+              WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+                AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+            ) THEN 'xhs'
+            WHEN (
+              rc.redeemed_by IS NOT NULL
+              AND trim(rc.redeemed_by) != ''
+              AND (lower(rc.redeemed_by) LIKE '%@%' OR lower(rc.redeemed_by) LIKE '%email:%')
+              AND NOT EXISTS (
+                SELECT 1
+                FROM purchase_orders po
+                WHERE (po.code_id = rc.id OR (po.code_id IS NULL AND po.code = rc.code))
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM credit_orders co
+                WHERE (co.code_id = rc.id OR (co.code_id IS NULL AND co.code = rc.code))
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM xhs_orders xo
+                WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM xianyu_orders xo
+                WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+              )
+            ) THEN 'manual'
+            ELSE NULL
+          END AS source
+        FROM gpt_accounts ga
+        JOIN redemption_codes rc ON lower(rc.account_email) = lower(ga.email)
+        WHERE ga.is_banned = 1
+          AND COALESCE(ga.ban_processed, 0) = 0
+          AND rc.is_redeemed = 1
+          AND rc.redeemed_at IS NOT NULL
+          AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
+          AND COALESCE(
+            NULLIF((
+              SELECT po2.order_type
+              FROM purchase_orders po2
+              WHERE (po2.code_id = rc.id OR (po2.code_id IS NULL AND po2.code = rc.code))
+              ORDER BY po2.created_at DESC
+              LIMIT 1
+            ), ''),
+            NULLIF(rc.order_type, ''),
+            'warranty'
+          ) != 'no_warranty'
+      ),
+      eligible_filtered AS (
+        SELECT *
+        FROM eligible_codes
+        WHERE source = ?
+      ),
+      eligible_enriched AS (
+        SELECT
+          ef.original_code_id,
+          ef.redeemed_at,
+          ll.status AS latest_status,
+          COALESCE(NULLIF(TRIM(cl.recovery_account_email), ''), ef.original_account_email) AS current_account_email
+        FROM eligible_filtered ef
+        LEFT JOIN log_latest ll ON ll.original_code_id = ef.original_code_id
+        LEFT JOIN completed_latest cl ON cl.original_code_id = ef.original_code_id
+      ),
+      eligible_with_current AS (
+        SELECT
+          ee.original_code_id,
+          ee.redeemed_at,
+          ee.latest_status,
+          CASE
+            WHEN current_ga.id IS NULL THEN 1
+            ELSE COALESCE(current_ga.is_banned, 0)
+          END AS current_is_banned
+        FROM eligible_enriched ee
+        LEFT JOIN gpt_accounts current_ga ON lower(current_ga.email) = lower(ee.current_account_email)
+      )
+    `.trim()
+
+    const eligibilityParams = [threshold, threshold, threshold, threshold, threshold, source]
+    const statsResult = db.exec(
+      `
+        ${eligibilitySql}
+        SELECT
+          SUM(CASE WHEN current_is_banned = 1 AND (latest_status IS NULL OR latest_status != 'failed') THEN 1 ELSE 0 END) AS pending_count,
+          SUM(CASE WHEN current_is_banned = 1 AND latest_status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+          SUM(CASE WHEN current_is_banned = 1 THEN 1 ELSE 0 END) AS need_count
+        FROM eligible_with_current
+      `,
+      eligibilityParams
+    )
+
+    const statsRow = statsResult[0]?.values?.[0] || []
+    const pendingCount = Number(statsRow[0] || 0)
+    const failedCount = Number(statsRow[1] || 0)
+    const needCount = Number(statsRow[2] || 0)
+
+    const willProcessCount = Math.min(needCount, availableCount, limit)
+
+    let originalCodeIds = []
+    if (willProcessCount > 0) {
+      const idsResult = db.exec(
+        `
+          ${eligibilitySql}
+          SELECT original_code_id
+          FROM eligible_with_current
+          WHERE current_is_banned = 1
+          ORDER BY redeemed_at ASC, original_code_id ASC
+          LIMIT ?
+        `,
+        [...eligibilityParams, willProcessCount]
+      )
+      originalCodeIds = (idsResult[0]?.values || [])
+        .map(row => Number(row?.[0] || 0))
+        .filter(value => Number.isFinite(value) && value > 0)
+    }
+
+    const generatedAtResult = db.exec(`SELECT DATETIME('now', 'localtime')`)
+    const generatedAtRaw = generatedAtResult[0]?.values?.[0]?.[0]
+    const generatedAt = generatedAtRaw ? String(generatedAtRaw) : new Date().toISOString()
+
+    return res.json({
+      source,
+      days,
+      pendingCount,
+      failedCount,
+      needCount,
+      availableCount,
+      willProcessCount,
+      originalCodeIds,
+      generatedAt
+    })
+  } catch (error) {
+    console.error('Account recovery one-click preview error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 router.post('/account-recovery/recover', async (req, res) => {
   try {
     const rawIds = req.body?.originalCodeIds ?? req.body?.original_code_ids ?? []
