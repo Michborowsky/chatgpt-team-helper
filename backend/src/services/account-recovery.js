@@ -118,15 +118,25 @@ export function resolveOrderDeadlineMs(db, { originalCodeId, originalCode, redee
 
 export function selectRecoveryCode(
   db,
-  { minExpireMs, capacityLimit = 6, preferNonToday = true, limit = 200 } = {}
+  {
+    minExpireMs,
+    capacityLimit = 6,
+    preferNonToday = true,
+    preferLatestExpire = false,
+    limit = 200
+  } = {}
 ) {
   if (!db) return null
 
   const nowMs = Date.now()
   const parsedMinExpireMs = Number(minExpireMs)
   const effectiveMinExpireMs = Math.max(nowMs, Number.isFinite(parsedMinExpireMs) ? parsedMinExpireMs : nowMs)
+  const effectiveMinExpireSeconds = Math.floor(effectiveMinExpireMs / 1000)
   const maxSeats = Math.max(1, Number(capacityLimit) || 6)
   const queryLimit = Math.min(500, Math.max(1, toInt(limit, 200)))
+  const orderSql = preferLatestExpire
+    ? 'ORDER BY ga.expire_at DESC, occupancy ASC, rc.id ASC'
+    : 'ORDER BY is_today ASC, ga.expire_at ASC, occupancy ASC, rc.id ASC'
 
   const recoveryCodeResult = db.exec(
     `
@@ -155,10 +165,11 @@ export function selectRecoveryCode(
         AND trim(ga.chatgpt_account_id) != ''
         AND ga.expire_at IS NOT NULL
         AND trim(ga.expire_at) != ''
-      ORDER BY is_today ASC, ga.expire_at ASC, occupancy ASC, rc.id ASC
+        AND DATETIME(REPLACE(ga.expire_at, '/', '-')) >= DATETIME(?, 'unixepoch', 'localtime')
+      ${orderSql}
       LIMIT ?
     `,
-    [maxSeats, queryLimit]
+    [maxSeats, effectiveMinExpireSeconds, queryLimit]
   )
 
   const rows = recoveryCodeResult?.[0]?.values || []
@@ -200,7 +211,9 @@ export function selectRecoveryCode(
   }
 
   pool.sort((a, b) => {
-    if (a.expireAtMs !== b.expireAtMs) return a.expireAtMs - b.expireAtMs
+    if (a.expireAtMs !== b.expireAtMs) {
+      return preferLatestExpire ? b.expireAtMs - a.expireAtMs : a.expireAtMs - b.expireAtMs
+    }
     if (a.occupancy !== b.occupancy) return a.occupancy - b.occupancy
     return a.recoveryCodeId - b.recoveryCodeId
   })

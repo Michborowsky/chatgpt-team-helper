@@ -39,6 +39,16 @@ const toInt = (value, fallback) => {
   const parsed = Number.parseInt(String(value ?? ''), 10)
   return Number.isFinite(parsed) ? parsed : fallback
 }
+const parseBoolean = (value, fallback) => {
+  if (value === undefined || value === null) return fallback
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  const raw = String(value).trim().toLowerCase()
+  if (!raw) return fallback
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false
+  return fallback
+}
 const HISTORY_CODE_MIN_ACCOUNT_REMAINING_DAYS = 30
 const ACCOUNT_RECOVERY_WINDOW_DAYS = Math.max(1, toInt(process.env.ACCOUNT_RECOVERY_WINDOW_DAYS, 30))
 const ORDER_TYPE_WARRANTY = 'warranty'
@@ -1451,13 +1461,15 @@ router.post('/recover', async (req, res) => {
 
       // 补录账号池（统一规则）：
       // - 只取开放账号（is_open=1）
-      // - 优先非当日（按 gpt_accounts.created_at 判断）
+      // - 严格模式下优先非当日（按 gpt_accounts.created_at 判断）
       // - 只用通用渠道兑换码（rc.channel 为空或 common）
-      // - 账号 expire_at 需覆盖订单截止日（若无法计算截止日，则至少不早于当前时间）
+      // - 账号 expire_at 需未过期；当 ACCOUNT_RECOVERY_IGNORE_ORDER_DEADLINE=false 时，还要求覆盖订单截止日
+      const ignoreDeadline = parseBoolean(process.env.ACCOUNT_RECOVERY_IGNORE_ORDER_DEADLINE, true)
       const selectedRecovery = selectRecoveryCode(db, {
-        minExpireMs: orderDeadlineMs,
+        minExpireMs: ignoreDeadline ? Date.now() : orderDeadlineMs,
         capacityLimit: 6,
-        preferNonToday: true,
+        preferNonToday: ignoreDeadline ? false : true,
+        preferLatestExpire: ignoreDeadline,
         limit: 200
       })
 

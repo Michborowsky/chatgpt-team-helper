@@ -272,14 +272,20 @@ async function requestChatgptText(apiUrl, { method, headers, data, proxy } = {},
   }
 
   const text = typeof response.data === 'string' ? response.data : (response.data == null ? '' : String(response.data))
-  return { status: response.status, text, proxyConfig }
+  return {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+    text,
+    proxyConfig
+  }
 }
 
 const parseJsonOrThrow = (text, { logContext, message }) => {
   try {
     return JSON.parse(text)
   } catch (error) {
-    console.error(message, logContext, error)
+    console.error(message, { ...logContext, body: text }, error)
     throw new AccountSyncError(message, 500)
   }
 }
@@ -302,13 +308,22 @@ export async function fetchOpenAiAccountInfo(token, proxy = null) {
   }
 
   const logContext = { url: apiUrl }
-  const { status, text } = await requestChatgptText(
+  const { status, statusText, headers: responseHeaders, text, proxyConfig } = await requestChatgptText(
     apiUrl,
     { method: 'GET', headers, proxy },
     logContext
   )
 
   if (status < 200 || status >= 300) {
+    console.error('OpenAI 校验 token 接口 HTTP 错误', {
+      ...logContext,
+      status,
+      statusText,
+      proxy: formatProxyConfigForLog(proxyConfig),
+      headers: responseHeaders
+    })
+    console.error('OpenAI 校验 token 接口 HTTP body:', text)
+
     if (status === 401) {
       throw new AccountSyncError('Token 已过期或无效', 401)
     }

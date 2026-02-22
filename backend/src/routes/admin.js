@@ -3021,10 +3021,12 @@ router.post('/account-recovery/recover', async (req, res) => {
           orderType: resolvedOrderType
         })
 
+        const ignoreDeadline = parseBoolean(process.env.ACCOUNT_RECOVERY_IGNORE_ORDER_DEADLINE, true)
         const selectedRecovery = selectRecoveryCode(db, {
-          minExpireMs: orderDeadlineMs,
+          minExpireMs: ignoreDeadline ? Date.now() : orderDeadlineMs,
           capacityLimit: 6,
-          preferNonToday: true,
+          preferNonToday: ignoreDeadline ? false : true,
+          preferLatestExpire: ignoreDeadline,
           limit: 200
         })
 

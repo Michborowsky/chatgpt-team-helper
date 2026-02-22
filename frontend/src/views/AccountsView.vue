@@ -154,6 +154,20 @@ const resolveRequestError = (err: any, fallback: string) => {
   )
 }
 
+const logHttpErrorWithBody = (label: string, err: any) => {
+  try {
+    console.error(label, {
+      message: err?.message,
+      status: err?.response?.status,
+      statusText: err?.response?.statusText,
+      headers: err?.response?.headers,
+      body: err?.response?.data
+    })
+  } catch (error) {
+    console.error(label, err, error)
+  }
+}
+
 const ensureSystemApiKey = async (): Promise<string | null> => {
   if (cachedApiKey.value) return cachedApiKey.value
 
@@ -345,6 +359,7 @@ const handleExchangeOpenaiCode = async () => {
         }
       } catch (err: any) {
         if (currentNonce !== openaiOAuthFlowNonce) return
+        logHttpErrorWithBody('[Accounts] 校验 token 失败（OAuth 自动检查）', err)
         // 不阻塞主流程，失败时允许用户手动填写
         const message = resolveRequestError(err, '获取账号到期时间失败')
         checkAccessTokenError.value = message
@@ -526,6 +541,7 @@ const handleCheckAccessToken = async () => {
     await openChatgptIdDropdown()
   } catch (err: any) {
     const message = err?.response?.data?.error || '校验失败'
+    logHttpErrorWithBody('[Accounts] 校验 token 失败', err)
     checkAccessTokenError.value = message
     showErrorToast(message)
   } finally {
