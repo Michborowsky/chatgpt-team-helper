@@ -54,10 +54,11 @@ import {
 } from '../services/purchase-products.js'
 import { withLocks } from '../utils/locks.js'
 import { redeemCodeInternal } from './redemption-codes.js'
-import { resolveOrderDeadlineMs, selectRecoveryCode } from '../services/account-recovery.js'
+import { buildAccountRecoveryEligibleCodeSql, resolveOrderDeadlineMs, selectRecoveryCode } from '../services/account-recovery.js'
 import { CHATGPT_OAI_CLIENT_VERSION } from '../services/account-client-profile.js'
 
 const router = express.Router()
+const ACCOUNT_RECOVERY_ELIGIBLE_CODE_SQL = buildAccountRecoveryEligibleCodeSql('rc')
 
 router.use(authenticateToken, requireSuperAdmin)
 
@@ -2744,6 +2745,7 @@ router.delete('/rbac/users/:id', async (req, res) => {
 	        WHERE ga.is_banned = 1
 	          AND rc.is_redeemed = 1
 	          AND rc.redeemed_at IS NOT NULL
+	          AND ${ACCOUNT_RECOVERY_ELIGIBLE_CODE_SQL}
 	          AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
 	          AND COALESCE(
 	            NULLIF((
@@ -3149,10 +3151,11 @@ router.get('/account-recovery/banned-accounts/:accountId/redeems', async (req, r
               ) THEN 'manual'
               ELSE NULL
             END AS source
-          FROM redemption_codes rc
-          WHERE rc.is_redeemed = 1
-            AND rc.redeemed_at IS NOT NULL
-            AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
+	          FROM redemption_codes rc
+	          WHERE rc.is_redeemed = 1
+	            AND rc.redeemed_at IS NOT NULL
+	            AND ${ACCOUNT_RECOVERY_ELIGIBLE_CODE_SQL}
+	            AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
             AND COALESCE(
               NULLIF((
                 SELECT po2.order_type
@@ -3287,10 +3290,11 @@ router.get('/account-recovery/banned-accounts/:accountId/redeems', async (req, r
               ) THEN 'manual'
               ELSE NULL
             END AS source
-          FROM redemption_codes rc
-          WHERE rc.is_redeemed = 1
-            AND rc.redeemed_at IS NOT NULL
-            AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
+	          FROM redemption_codes rc
+	          WHERE rc.is_redeemed = 1
+	            AND rc.redeemed_at IS NOT NULL
+	            AND ${ACCOUNT_RECOVERY_ELIGIBLE_CODE_SQL}
+	            AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
             AND COALESCE(
               NULLIF((
                 SELECT po2.order_type
@@ -3457,10 +3461,11 @@ router.get('/account-recovery/one-click/preview', async (req, res) => {
       `
         SELECT COUNT(*)
         FROM redemption_codes rc
-        JOIN gpt_accounts ga ON lower(trim(ga.email)) = lower(trim(rc.account_email))
-        WHERE rc.is_redeemed = 0
-          AND COALESCE(rc.is_downstream_sold, 0) = 0
-          AND rc.account_email IS NOT NULL
+	        JOIN gpt_accounts ga ON lower(trim(ga.email)) = lower(trim(rc.account_email))
+	        WHERE rc.is_redeemed = 0
+	          AND COALESCE(rc.is_downstream_sold, 0) = 0
+	          AND ${ACCOUNT_RECOVERY_ELIGIBLE_CODE_SQL}
+	          AND rc.account_email IS NOT NULL
           AND trim(rc.account_email) != ''
           AND COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
           AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
@@ -3575,12 +3580,13 @@ router.get('/account-recovery/one-click/preview', async (req, res) => {
             ELSE NULL
           END AS source
         FROM gpt_accounts ga
-        JOIN redemption_codes rc ON lower(trim(rc.account_email)) = lower(trim(ga.email))
-        WHERE ga.is_banned = 1
-          AND COALESCE(ga.ban_processed, 0) = 0
-          AND rc.is_redeemed = 1
-          AND rc.redeemed_at IS NOT NULL
-          AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
+	        JOIN redemption_codes rc ON lower(trim(rc.account_email)) = lower(trim(ga.email))
+	        WHERE ga.is_banned = 1
+	          AND COALESCE(ga.ban_processed, 0) = 0
+	          AND rc.is_redeemed = 1
+	          AND rc.redeemed_at IS NOT NULL
+	          AND ${ACCOUNT_RECOVERY_ELIGIBLE_CODE_SQL}
+	          AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
           AND COALESCE(
             NULLIF((
               SELECT po2.order_type
@@ -3729,10 +3735,11 @@ router.post('/account-recovery/recover', async (req, res) => {
 	            LEFT JOIN account_recovery_logs ar_recovery
 	              ON ar_recovery.recovery_code_id = rc.id
 	              AND ar_recovery.status IN ('success', 'skipped')
-	            WHERE rc.id = ?
-	              AND rc.is_redeemed = 1
-	              AND rc.redeemed_at IS NOT NULL
-	              AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
+		            WHERE rc.id = ?
+		              AND rc.is_redeemed = 1
+		              AND rc.redeemed_at IS NOT NULL
+		              AND ${ACCOUNT_RECOVERY_ELIGIBLE_CODE_SQL}
+		              AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
 	              AND ar_recovery.id IS NULL
 	              AND ga.is_banned = 1
 		              AND (

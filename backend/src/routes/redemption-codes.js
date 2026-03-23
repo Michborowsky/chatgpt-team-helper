@@ -30,11 +30,12 @@ import {
 import { withLocks } from '../utils/locks.js'
 import { requireFeatureEnabled } from '../middleware/feature-flags.js'
 import { getChannels, normalizeChannelKey } from '../utils/channels.js'
-import { resolveOrderDeadlineMs, selectRecoveryCode } from '../services/account-recovery.js'
+import { buildAccountRecoveryEligibleCodeSql, resolveOrderDeadlineMs, selectRecoveryCode } from '../services/account-recovery.js'
 import { getAccountRecoverySettings } from '../utils/account-recovery-settings.js'
 import { checkViaUpstreamProvider, redeemViaUpstreamProvider } from '../services/upstream-provider.js'
 
 const router = express.Router()
+const ACCOUNT_RECOVERY_ELIGIBLE_CODE_SQL = buildAccountRecoveryEligibleCodeSql('rc')
 
 const normalizeChannel = (value, fallback = 'common') => normalizeChannelKey(value, fallback)
 const toInt = (value, fallback) => {
@@ -1905,6 +1906,7 @@ router.post('/recover', async (req, res) => {
               AND ar_recovery.status IN ('success', 'skipped')
             WHERE rc.is_redeemed = 1
               AND rc.redeemed_at IS NOT NULL
+              AND ${ACCOUNT_RECOVERY_ELIGIBLE_CODE_SQL}
               AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
               AND ar_recovery.id IS NULL
               AND (

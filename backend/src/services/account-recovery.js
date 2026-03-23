@@ -7,6 +7,8 @@ const ORDER_TYPE_WARRANTY = 'warranty'
 const ORDER_TYPE_NO_WARRANTY = 'no_warranty'
 const ORDER_TYPE_ANTI_BAN = 'anti_ban'
 const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY, ORDER_TYPE_ANTI_BAN])
+const ACCOUNT_RECOVERY_EXCLUDED_FULFILLMENT_MODE = 'external_api'
+const ACCOUNT_RECOVERY_EXCLUDED_REDEEM_MODE = 'external-card'
 
 const normalizeOrderType = (value) => {
   const normalized = String(value || '').trim().toLowerCase()
@@ -14,6 +16,19 @@ const normalizeOrderType = (value) => {
 }
 
 const isNoWarrantyOrderType = (value) => normalizeOrderType(value) === ORDER_TYPE_NO_WARRANTY
+
+export const buildAccountRecoveryEligibleCodeSql = (alias = 'rc') => {
+  const codeAlias = String(alias || 'rc').trim() || 'rc'
+  return `
+    COALESCE(NULLIF(LOWER(TRIM(${codeAlias}.fulfillment_mode)), ''), 'internal_invite') != '${ACCOUNT_RECOVERY_EXCLUDED_FULFILLMENT_MODE}'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM channels recovery_ch
+      WHERE LOWER(TRIM(recovery_ch.key)) = COALESCE(NULLIF(LOWER(TRIM(${codeAlias}.channel)), ''), 'common')
+        AND LOWER(TRIM(COALESCE(recovery_ch.redeem_mode, ''))) = '${ACCOUNT_RECOVERY_EXCLUDED_REDEEM_MODE}'
+    )
+  `.trim()
+}
 
 const DEFAULT_WARRANTY_SERVICE_DAYS = Math.max(1, toInt(process.env.PURCHASE_SERVICE_DAYS, 30))
 const DEFAULT_NO_WARRANTY_SERVICE_DAYS = Math.max(
@@ -163,6 +178,7 @@ export function selectRecoveryCode(
       JOIN gpt_accounts ga ON lower(trim(ga.email)) = lower(trim(rc.account_email))
       WHERE rc.is_redeemed = 0
         AND COALESCE(rc.is_downstream_sold, 0) = 0
+        AND ${buildAccountRecoveryEligibleCodeSql('rc')}
         AND rc.account_email IS NOT NULL
         AND trim(rc.account_email) != ''
         AND COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
