@@ -10,6 +10,8 @@ import XhsRedeemView from '../views/XhsRedeemView.vue'
 import XianyuRedeemView from '../views/XianyuRedeemView.vue'
 import PurchaseCatalogView from '../views/PurchaseCatalogView.vue'
 import PurchaseProductView from '../views/PurchaseProductView.vue'
+import DownstreamView from '../views/DownstreamView.vue'
+import DownstreamOrderView from '../views/DownstreamOrderView.vue'
 import OrderView from '../views/OrderView.vue'
 import WaitingRoomView from '../views/WaitingRoomView.vue'
 import MainLayout from '../views/MainLayout.vue'
@@ -69,6 +71,18 @@ const router = createRouter({
       path: '/order',
       name: 'order',
       component: OrderView,
+      meta: { featureKey: 'payment' },
+    },
+    {
+      path: '/downstream',
+      name: 'downstream',
+      component: DownstreamView,
+      meta: { featureKey: 'payment' },
+    },
+    {
+      path: '/downstream/order',
+      name: 'downstream-order',
+      component: DownstreamOrderView,
       meta: { featureKey: 'payment' },
     },
     {

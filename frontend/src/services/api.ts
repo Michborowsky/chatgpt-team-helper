@@ -479,6 +479,7 @@ export interface RefreshTokenResponse {
 }
 
 export type RedemptionChannel = string
+export type PurchaseOrderScene = 'retail' | 'downstream'
 
 export interface Channel {
   key: string
@@ -486,6 +487,7 @@ export interface Channel {
   redeemMode: string
   providerType: string
   allowCommonFallback: boolean
+  allowDownstreamSale: boolean
   isActive: boolean
   isBuiltin: boolean
   sortOrder: number
@@ -515,6 +517,8 @@ export interface RedemptionCode {
   reservedForUsername?: string | null
   reservedForEntryId?: number | null
   reservedAt?: string | null
+  isDownstreamSold?: boolean
+  downstreamSoldAt?: string | null
   fulfillmentMode?: string | null
   supplierName?: string | null
   supplierType?: string | null
@@ -601,6 +605,7 @@ export interface PurchaseOrder {
   productName: string
   amount: string
   serviceDays: number
+  quantity?: number
   productKey?: string | null
   codeChannel?: string | null
   orderType?: PurchaseOrderType
@@ -608,6 +613,7 @@ export interface PurchaseOrder {
   payUrl?: string | null
   qrcode?: string | null
   img?: string | null
+  orderScene?: PurchaseOrderScene
   status: string
   createdAt: string
   paidAt?: string | null
@@ -618,6 +624,8 @@ export interface PurchaseOrder {
   refundAmount?: string | null
   refundMessage?: string | null
   emailSentAt?: string | null
+  downstreamItemCount?: number
+  downstreamRedeemedCount?: number
 }
 
 export interface PurchaseOrderQueryResponse {
@@ -1008,6 +1016,21 @@ export interface AdminZpaySettingsResponse {
   }
 }
 
+export interface AdminDownstreamSaleSettingsResponse {
+  downstreamSale: {
+    enabled: boolean
+    enabledStored?: boolean
+    productName: string
+    productNameStored?: boolean
+    amount: string
+    amountStored?: boolean
+    payAlipayEnabled: boolean
+    payAlipayEnabledStored?: boolean
+    payWxpayEnabled: boolean
+    payWxpayEnabledStored?: boolean
+  }
+}
+
 export interface AdminTurnstileSettingsResponse {
   turnstile: {
     siteKey: string
@@ -1033,6 +1056,31 @@ export interface AdminTelegramSettingsResponse {
   }
 }
 
+export interface AdminProxySettingsResponse {
+  proxy: {
+    proxyUrls: string
+    stored?: boolean
+    effectiveCount: number
+  }
+}
+
+export interface AdminProxyTestResult {
+  proxy: string
+  ok: boolean
+  reachable: boolean
+  status: number
+  durationMs: number
+  message: string
+  bodySnippet?: string
+}
+
+export interface AdminProxyTestResponse {
+  total: number
+  passed: number
+  failed: number
+  results: AdminProxyTestResult[]
+}
+
 export interface AdminUpstreamSettingsResponse {
   upstream: {
     providerEnabled: boolean
@@ -1053,8 +1101,18 @@ export interface AdminUpstreamSettingsResponse {
     outboundApiKeyStored?: boolean
     apiEnabled: boolean
     apiEnabledStored?: boolean
-    incomingApiKeySet: boolean
-    incomingApiKeyStored?: boolean
+    publicBaseUrl: string
+    publicBaseUrlStored?: boolean
+    inboundClients: Array<{
+      id: string
+      domain: string
+      apiKeySet: boolean
+      apiKeyStored?: boolean
+      legacy?: boolean
+    }>
+    inboundClientsStored?: boolean
+    legacyIncomingApiKeySet?: boolean
+    legacyIncomingApiKeyStored?: boolean
   }
 }
 
@@ -1247,6 +1305,24 @@ export const adminService = {
     return response.data
   },
 
+  async getDownstreamSaleSettings(): Promise<AdminDownstreamSaleSettingsResponse> {
+    const response = await api.get('/admin/downstream-sale-settings')
+    return response.data
+  },
+
+  async updateDownstreamSaleSettings(payload: {
+    downstreamSale: {
+      enabled: boolean
+      productName: string
+      amount: string
+      payAlipayEnabled: boolean
+      payWxpayEnabled: boolean
+    }
+  }): Promise<AdminDownstreamSaleSettingsResponse> {
+    const response = await api.put('/admin/downstream-sale-settings', payload)
+    return response.data
+  },
+
   async getTurnstileSettings(): Promise<AdminTurnstileSettingsResponse> {
     const response = await api.get('/admin/turnstile-settings')
     return response.data
@@ -1275,6 +1351,21 @@ export const adminService = {
     return response.data
   },
 
+  async getProxySettings(): Promise<AdminProxySettingsResponse> {
+    const response = await api.get('/admin/proxy-settings')
+    return response.data
+  },
+
+  async updateProxySettings(payload: { proxy: { proxyUrls: string } }): Promise<AdminProxySettingsResponse> {
+    const response = await api.put('/admin/proxy-settings', payload)
+    return response.data
+  },
+
+  async testProxySettings(payload?: { proxy: { proxyUrls: string } }): Promise<AdminProxyTestResponse> {
+    const response = await api.post('/admin/proxy-settings/test', payload || {})
+    return response.data
+  },
+
   async getUpstreamSettings(): Promise<AdminUpstreamSettingsResponse> {
     const response = await api.get('/admin/upstream-settings')
     return response.data
@@ -1291,6 +1382,12 @@ export const adminService = {
       timeoutMs: number
       outboundApiKey?: string
       apiEnabled: boolean
+      publicBaseUrl?: string
+      inboundClients?: Array<{
+        id?: string
+        domain?: string
+        apiKey?: string
+      }>
       incomingApiKey?: string
     }
   }): Promise<AdminUpstreamSettingsResponse> {
@@ -1408,6 +1505,7 @@ export const adminService = {
     redeemMode?: string
     providerType?: string
     allowCommonFallback?: boolean
+    allowDownstreamSale?: boolean
     isActive?: boolean
     sortOrder?: number
   }): Promise<{ channel: Channel }> {
@@ -1417,7 +1515,15 @@ export const adminService = {
 
   async updateChannel(
     key: string,
-    payload: { name?: string; redeemMode?: string; providerType?: string; allowCommonFallback?: boolean; isActive?: boolean; sortOrder?: number }
+    payload: {
+      name?: string
+      redeemMode?: string
+      providerType?: string
+      allowCommonFallback?: boolean
+      allowDownstreamSale?: boolean
+      isActive?: boolean
+      sortOrder?: number
+    }
   ): Promise<{ channel: Channel }> {
     const response = await api.patch(`/admin/channels/${encodeURIComponent(key)}`, payload)
     return response.data
@@ -2063,7 +2169,7 @@ export const redemptionCodeService = {
     page?: number
     pageSize?: number
     search?: string
-    status?: 'all' | 'redeemed' | 'unused'
+    status?: 'all' | 'redeemed' | 'unused' | 'downstream_sold'
   }): Promise<{
     codes: RedemptionCode[]
     pagination: { page: number; pageSize: number; total: number }
@@ -2098,6 +2204,25 @@ export const redemptionCodeService = {
     codes: RedemptionCode[]
   }> {
     const response = await api.post('/redemption-codes/import-external', data)
+    return response.data
+  },
+
+  async checkUpstream(id: number): Promise<{
+    message: string
+    result: {
+      ok: boolean
+      status: string
+      retryable?: boolean
+      providerType?: string
+      supplierName?: string
+      supplierRequestId?: string
+      responseCode?: string
+      message?: string
+      data?: any
+    }
+    code: RedemptionCode | null
+  }> {
+    const response = await api.post(`/redemption-codes/${id}/upstream-check`)
     return response.data
   },
 
@@ -2325,6 +2450,62 @@ export interface PurchaseMyOrdersSummaryResponse {
   }>
 }
 
+export interface DownstreamMeta {
+  enabled: boolean
+  productName: string
+  amount: string
+  payAlipayEnabled: boolean
+  payWxpayEnabled: boolean
+  payMethods: Array<'alipay' | 'wxpay'>
+  availableCount: number
+}
+
+export interface DownstreamCreateOrderResponse {
+  orderNo: string
+  quantity: number
+  amount: string
+  unitAmount?: string | null
+  productName: string
+  payType: 'alipay' | 'wxpay'
+  payUrl?: string | null
+  qrcode?: string | null
+  img?: string | null
+}
+
+export interface DownstreamOrderItem {
+  publicCode: string
+  status: 'unused' | 'redeemed' | string
+  redeemedAt?: string | null
+}
+
+export interface DownstreamOrder {
+  orderNo: string
+  tradeNo?: string | null
+  email: string
+  productName: string
+  amount: string
+  unitAmount?: string | null
+  orderScene: PurchaseOrderScene
+  quantity: number
+  payType?: 'alipay' | 'wxpay' | null
+  payUrl?: string | null
+  qrcode?: string | null
+  img?: string | null
+  status: string
+  createdAt: string
+  paidAt?: string | null
+  inviteStatus?: string | null
+  redeemError?: string | null
+  refundedAt?: string | null
+  refundAmount?: string | null
+  refundMessage?: string | null
+  items: DownstreamOrderItem[]
+}
+
+export interface DownstreamOrderQueryResponse {
+  order: DownstreamOrder
+}
+
 export const purchaseService = {
   async getMeta(): Promise<PurchaseMeta> {
     const response = await api.get('/purchase/meta')
@@ -2373,6 +2554,28 @@ export const purchaseService = {
 
   async myBindOrder(orderNo: string): Promise<{ message: string; order: PurchaseOrder }> {
     const response = await api.post('/purchase/my/orders/bind', { orderNo })
+    return response.data
+  },
+}
+
+export const downstreamService = {
+  async getMeta(): Promise<DownstreamMeta> {
+    const response = await api.get('/downstream/meta')
+    return response.data
+  },
+
+  async createOrder(payload: { email: string; type: 'alipay' | 'wxpay'; quantity: number }): Promise<DownstreamCreateOrderResponse> {
+    const response = await api.post('/downstream/orders', payload)
+    return response.data
+  },
+
+  async getOrder(orderNo: string, email: string, options?: { sync?: boolean }): Promise<DownstreamOrderQueryResponse> {
+    const response = await api.get(`/downstream/orders/${encodeURIComponent(orderNo)}`, {
+      params: {
+        email,
+        sync: options?.sync ? 1 : undefined,
+      }
+    })
     return response.data
   },
 }

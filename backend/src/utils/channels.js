@@ -30,18 +30,19 @@ const mapChannelRow = (row) => {
     })(),
     providerType: normalizeProviderType(row[3]),
     allowCommonFallback: Number(row[4] || 0) === 1,
-    isActive: Number(row[5] ?? 1) !== 0,
-    isBuiltin: Number(row[6] || 0) === 1,
-    sortOrder: Number(row[7] || 0) || 0,
-    createdAt: row[8] || null,
-    updatedAt: row[9] || null,
+    allowDownstreamSale: Number(row[5] || 0) === 1,
+    isActive: Number(row[6] ?? 1) !== 0,
+    isBuiltin: Number(row[7] || 0) === 1,
+    sortOrder: Number(row[8] || 0) || 0,
+    createdAt: row[9] || null,
+    updatedAt: row[10] || null,
   }
 }
 
 const loadChannelsFromDb = (database) => {
   const result = database.exec(
     `
-      SELECT key, name, redeem_mode, provider_type, allow_common_fallback, is_active, is_builtin, sort_order, created_at, updated_at
+      SELECT key, name, redeem_mode, provider_type, allow_common_fallback, allow_downstream_sale, is_active, is_builtin, sort_order, created_at, updated_at
       FROM channels
       ORDER BY sort_order ASC, id ASC
     `

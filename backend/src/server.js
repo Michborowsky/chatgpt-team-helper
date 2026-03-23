@@ -15,6 +15,7 @@ import xhsRoutes from './routes/xhs.js'
 import xianyuRoutes from './routes/xianyu.js'
 import openAccountsRoutes from './routes/open-accounts.js'
 import purchaseRoutes from './routes/purchase.js'
+import downstreamRoutes from './routes/downstream.js'
 import creditRoutes from './routes/credit.js'
 import adminRoutes from './routes/admin.js'
 import adminStatsRoutes from './routes/admin-stats.js'
@@ -76,7 +77,7 @@ app.use(
       return callback(null, corsOrigins.has(origin))
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Linuxdo-Token', 'X-Upstream-Key'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Linuxdo-Token', 'X-Upstream-Key', 'X-Downstream-Domain'],
     credentials: false,
     maxAge: 86400
   })
@@ -136,6 +137,7 @@ app.use('/api/xhs', xhsRoutes)
 app.use('/api/xianyu', xianyuRoutes)
 app.use('/api/open-accounts', openAccountsRoutes)
 app.use('/api/purchase', purchaseRoutes)
+app.use('/api/downstream', downstreamRoutes)
 app.use('/api/credit', creditRoutes)
 app.use('/api/admin/stats', adminStatsRoutes)
 app.use('/api/admin/announcements', adminAnnouncementsRoutes)

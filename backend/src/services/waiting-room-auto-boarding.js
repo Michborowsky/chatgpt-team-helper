@@ -112,6 +112,7 @@ function fetchAvailableLinuxDoCode(db) {
       FROM redemption_codes
       WHERE channel = 'linux-do'
         AND is_redeemed = 0
+        AND COALESCE(is_downstream_sold, 0) = 0
         AND reserved_for_entry_id IS NULL
         AND (reserved_for_uid IS NULL OR TRIM(reserved_for_uid) = '')
       ORDER BY datetime(created_at) ASC

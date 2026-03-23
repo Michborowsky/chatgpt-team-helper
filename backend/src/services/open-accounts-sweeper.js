@@ -1,6 +1,6 @@
 import { getDatabase, saveDatabase } from '../database/init.js'
 import { withLocks } from '../utils/locks.js'
-import { formatProxyForLog, loadProxyList, pickProxyByHash } from '../utils/proxy.js'
+import { formatProxyForLog, loadDefaultProxyList, pickProxyByHash } from '../utils/proxy.js'
 import { AccountSyncError, deleteAccountUser, fetchAccountUsersList, syncAccountInviteCount, syncAccountUserCount } from './account-sync.js'
 import { sendOpenAccountsSweeperReportEmail } from './email-service.js'
 import { getFeatureFlags, isFeatureEnabled } from '../utils/feature-flags.js'
@@ -147,7 +147,7 @@ export const startOpenAccountsOvercapacitySweeper = () => {
       const max = maxJoined()
 	      const workerCount = Math.min(concurrency(), accountRows.length)
 	      const queue = [...accountRows]
-	      const proxies = loadProxyList()
+	      const proxies = await loadDefaultProxyList()
 	      const results = []
 	      const failures = []
 	      let totalKicked = 0

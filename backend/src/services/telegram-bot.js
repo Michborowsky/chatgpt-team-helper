@@ -5,6 +5,8 @@ import { getDatabase, saveDatabase } from '../database/init.js'
 import { getExpectedApiKey } from '../middleware/api-key-auth.js'
 import { userHasRoleKey } from './rbac.js'
 import { getTelegramSettings } from '../utils/telegram-settings.js'
+import { withLocks } from '../utils/locks.js'
+import { getPublicBaseUrlSettings } from '../utils/public-base-url.js'
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const CODE_REGEX = /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/
@@ -303,12 +305,13 @@ export async function startTelegramBot() {
     return true
   }
 
-  const getPurchaseMessage = () => {
+  const getPurchaseMessage = async () => {
     const purchaseUrl =
       (process.env.PURCHASE_URL ||
         process.env.PURCHASE_LINK ||
         '').trim()
-    const publicBaseUrl = String(process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '')
+    const publicBaseUrlSettings = await getPublicBaseUrlSettings()
+    const publicBaseUrl = String(publicBaseUrlSettings.baseUrl || '').trim().replace(/\/+$/, '')
     const fallbackUrl = purchaseUrl || (publicBaseUrl ? `${publicBaseUrl}/purchase` : '')
 
     if (!fallbackUrl) {
@@ -418,11 +421,13 @@ export async function startTelegramBot() {
   const handleRedeemSubmission = async (chatId, email, code) => {
     try {
       await bot.sendChatAction(chatId, 'typing')
-      const result = await redeemCodeInternal({
-        email,
-        code,
-        channel: 'common'
-      })
+      const result = await withLocks(['purchase', `redemption-code:${code}`], () => (
+        redeemCodeInternal({
+          email,
+          code,
+          channel: 'common'
+        })
+      ))
       const { data, metadata } = result || {}
       const inviteStatus = data?.inviteStatus || '邀请状态未知'
       const lines = [
@@ -642,7 +647,7 @@ export async function startTelegramBot() {
       sessions.set(chatId, { stage: 'awaitingBuyEmail' })
       await bot.sendMessage(chatId, lines.join('\n'))
     } catch (error) {
-      const fallback = getPurchaseMessage()
+      const fallback = await getPurchaseMessage()
       await bot.sendMessage(
         chatId,
         `❌ 无法发起购买流程：${error?.message || String(error)}\n\n可改用网页购买：\n${fallback}`

@@ -200,6 +200,7 @@ const getTodayCommonCodeCount = (db) => {
 	      WHERE rc.is_redeemed = 0
 	        AND rc.channel = 'common'
 	        AND DATE(rc.created_at) = DATE('now', 'localtime')
+        AND COALESCE(rc.is_downstream_sold, 0) = 0
         AND (rc.reserved_for_uid IS NULL OR TRIM(rc.reserved_for_uid) = '')
         AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
         AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
@@ -217,6 +218,7 @@ const pickTodayCommonCode = (db) => {
 	      WHERE rc.is_redeemed = 0
 	        AND rc.channel = 'common'
 	        AND DATE(rc.created_at) = DATE('now', 'localtime')
+        AND COALESCE(rc.is_downstream_sold, 0) = 0
         AND (rc.reserved_for_uid IS NULL OR TRIM(rc.reserved_for_uid) = '')
         AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
         AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
@@ -358,7 +360,7 @@ router.post('/points/redeem/team', authenticateToken, async (req, res) => {
   const requestedEmail = String(req.body?.email || '').trim()
 
   try {
-    const result = await withLocks([`points:redeem-team`, `points:user:${userId}`], async () => {
+    const result = await withLocks([`points:redeem-team`, `points:user:${userId}`, 'purchase'], async () => {
       const db = await getDatabase()
       const userResult = db.exec(
         'SELECT email, COALESCE(points, 0) FROM users WHERE id = ? LIMIT 1',
@@ -386,12 +388,14 @@ router.post('/points/redeem/team', authenticateToken, async (req, res) => {
         return { ok: false, status: 409, error: '今日可兑换名额不足，请稍后再试' }
       }
 
-      const redemption = await redeemCodeInternal({
-        email,
-        code,
-        channel: 'common',
-        skipCodeFormatValidation: true
-      })
+      const redemption = await withLocks([`redemption-code:${code}`], () => (
+        redeemCodeInternal({
+          email,
+          code,
+          channel: 'common',
+          skipCodeFormatValidation: true
+        })
+      ))
 
       db.run('UPDATE users SET points = COALESCE(points, 0) - ? WHERE id = ?', [TEAM_SEAT_COST_POINTS, userId])
       safeInsertPointsLedgerEntry(db, {

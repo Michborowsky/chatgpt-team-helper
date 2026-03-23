@@ -16,6 +16,13 @@ import { sendTelegramBotNotification } from '../services/telegram-notifier.js'
 import { requireFeatureEnabled } from '../middleware/feature-flags.js'
 import { getUpstreamSettings } from '../utils/upstream-settings.js'
 import { getUpstreamProviderReadiness } from '../services/upstream-provider.js'
+import { getPublicBaseUrlSettings, resolvePublicBaseUrl } from '../utils/public-base-url.js'
+import {
+  generateDownstreamPublicCode,
+  listDownstreamOrderItems,
+  listReservedRedemptionCodesByOrderNo,
+  releaseReservedCodesByOrderNo
+} from '../utils/downstream-order-items.js'
 
 const router = express.Router()
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production'
@@ -65,15 +72,6 @@ const getClientIp = (req) => {
     return normalizeIp(forwardedFor.split(',')[0].trim())
   }
   return normalizeIp(req.ip)
-}
-
-const getPublicBaseUrl = (req) => {
-  const configured = String(process.env.PUBLIC_BASE_URL || '').trim()
-  if (configured) return configured.replace(/\/+$/, '')
-  const protoHeader = req.headers['x-forwarded-proto']
-  const protocol = typeof protoHeader === 'string' && protoHeader.trim() ? protoHeader.split(',')[0].trim() : req.protocol
-  const host = req.get('host')
-  return `https://${host}`
 }
 
 const md5 = (value) => crypto.createHash('md5').update(String(value), 'utf8').digest('hex')
@@ -140,7 +138,11 @@ const NO_WARRANTY_REWARD_POINTS = 1
 const CODE_CHANNEL_COMMON = 'common'
 const CODE_CHANNEL_PAYPAL = 'paypal'
 const SUPPLIER_STATUS_INVALID = 'invalid'
+const SUPPLIER_STATUS_USED = 'used'
 const SUPPLIER_STATUS_PROCESSING = 'processing'
+export const ORDER_SCENE_RETAIL = 'retail'
+export const ORDER_SCENE_DOWNSTREAM = 'downstream'
+const ORDER_SCENE_SET = new Set([ORDER_SCENE_RETAIL, ORDER_SCENE_DOWNSTREAM])
 
 const parseOrderType = (value) => {
   const normalized = String(value || '').trim().toLowerCase()
@@ -148,6 +150,10 @@ const parseOrderType = (value) => {
 }
 
 const normalizeOrderType = (value) => parseOrderType(value) || ORDER_TYPE_WARRANTY
+const normalizeOrderScene = (value) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  return ORDER_SCENE_SET.has(normalized) ? normalized : ORDER_SCENE_RETAIL
+}
 
 const resolvePurchaseCodeChannel = (orderType) => (
   normalizeOrderType(orderType) === ORDER_TYPE_WARRANTY ? CODE_CHANNEL_PAYPAL : CODE_CHANNEL_COMMON
@@ -426,11 +432,11 @@ const awardBuyerPointsForPaidOrderLocked = (db, orderNo, order) => {
   return { ok: true, rewarded: true, userId, rewardPoints }
 }
 
-const cleanupExpiredOrders = (db, { expireMinutes }) => {
+export const cleanupExpiredOrders = (db, { expireMinutes }) => {
   const threshold = `-${Math.max(5, expireMinutes)} minutes`
   const result = db.exec(
     `
-      SELECT order_no, code_id
+      SELECT order_no
       FROM purchase_orders
       WHERE paid_at IS NULL
         AND status IN ('created', 'pending_payment')
@@ -445,27 +451,11 @@ const cleanupExpiredOrders = (db, { expireMinutes }) => {
   let released = 0
   for (const row of rows) {
     const orderNo = row[0]
-    const codeId = row[1]
     db.run(
       `UPDATE purchase_orders SET status = 'expired', updated_at = DATETIME('now', 'localtime') WHERE order_no = ? AND paid_at IS NULL`,
       [orderNo]
     )
-    if (codeId) {
-      db.run(
-        `
-          UPDATE redemption_codes
-          SET reserved_for_order_no = NULL,
-              reserved_for_order_email = NULL,
-              reserved_at = NULL,
-              updated_at = DATETIME('now', 'localtime')
-          WHERE id = ?
-            AND is_redeemed = 0
-            AND reserved_for_order_no = ?
-        `,
-        [codeId, orderNo]
-      )
-      released += 1
-    }
+    released += releaseReservedCodesByOrderNo(db, orderNo)
   }
   return released
 }
@@ -483,6 +473,7 @@ const getInternalAvailableCodeCount = (db, { channel } = {}) => {
         AND ga.is_open = 1
         AND ga.user_count < 6
         AND DATE(ga.created_at) = DATE('now', 'localtime')
+        AND COALESCE(rc.is_downstream_sold, 0) = 0
         AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
         AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
     `,
@@ -499,11 +490,12 @@ const getExternalAvailableCodeCount = (db, { channel } = {}) => {
       FROM redemption_codes rc
       WHERE rc.is_redeemed = 0
         AND COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = ?
+        AND COALESCE(rc.is_downstream_sold, 0) = 0
         AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
         AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-        AND COALESCE(NULLIF(lower(trim(rc.supplier_status)), ''), 'pending') NOT IN (?, ?)
+        AND COALESCE(NULLIF(lower(trim(rc.supplier_status)), ''), 'pending') NOT IN (?, ?, ?)
     `,
-    [resolvedChannel, SUPPLIER_STATUS_INVALID, SUPPLIER_STATUS_PROCESSING]
+    [resolvedChannel, SUPPLIER_STATUS_INVALID, SUPPLIER_STATUS_USED, SUPPLIER_STATUS_PROCESSING]
   )
   return Number(result[0]?.values?.[0]?.[0] || 0)
 }
@@ -527,6 +519,7 @@ const reserveInternalCode = (db, { orderNo, email, channel } = {}) => {
         AND ga.is_open = 1
         AND ga.user_count < 6
         AND DATE(ga.created_at) = DATE('now', 'localtime')
+        AND COALESCE(rc.is_downstream_sold, 0) = 0
         AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
         AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
       ORDER BY rc.created_at ASC
@@ -547,6 +540,7 @@ const reserveInternalCode = (db, { orderNo, email, channel } = {}) => {
           updated_at = DATETIME('now', 'localtime')
       WHERE id = ?
         AND is_redeemed = 0
+        AND COALESCE(is_downstream_sold, 0) = 0
         AND (reserved_for_order_no IS NULL OR reserved_for_order_no = '')
     `,
     [orderNo, email, codeId]
@@ -563,13 +557,14 @@ const reserveExternalCode = (db, { orderNo, email, channel } = {}) => {
       FROM redemption_codes rc
       WHERE rc.is_redeemed = 0
         AND COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = ?
+        AND COALESCE(rc.is_downstream_sold, 0) = 0
         AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
         AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-        AND COALESCE(NULLIF(lower(trim(rc.supplier_status)), ''), 'pending') NOT IN (?, ?)
+        AND COALESCE(NULLIF(lower(trim(rc.supplier_status)), ''), 'pending') NOT IN (?, ?, ?)
       ORDER BY rc.created_at ASC, rc.id ASC
       LIMIT 1
     `,
-    [resolvedChannel, SUPPLIER_STATUS_INVALID, SUPPLIER_STATUS_PROCESSING]
+    [resolvedChannel, SUPPLIER_STATUS_INVALID, SUPPLIER_STATUS_USED, SUPPLIER_STATUS_PROCESSING]
   )[0]?.values?.[0]
 
   if (!row) return null
@@ -584,10 +579,11 @@ const reserveExternalCode = (db, { orderNo, email, channel } = {}) => {
           updated_at = DATETIME('now', 'localtime')
       WHERE id = ?
         AND is_redeemed = 0
+        AND COALESCE(is_downstream_sold, 0) = 0
         AND (reserved_for_order_no IS NULL OR reserved_for_order_no = '')
-        AND COALESCE(NULLIF(lower(trim(supplier_status)), ''), 'pending') NOT IN (?, ?)
+        AND COALESCE(NULLIF(lower(trim(supplier_status)), ''), 'pending') NOT IN (?, ?, ?)
     `,
-    [orderNo, email, codeId, SUPPLIER_STATUS_INVALID, SUPPLIER_STATUS_PROCESSING]
+    [orderNo, email, codeId, SUPPLIER_STATUS_INVALID, SUPPLIER_STATUS_USED, SUPPLIER_STATUS_PROCESSING]
   )
 
   return { codeId, code, accountEmail }
@@ -599,7 +595,7 @@ const reserveAvailableCode = (db, { orderNo, email, channel, channelConfig } = {
     : reserveInternalCode(db, { orderNo, email, channel })
 )
 
-const resolvePurchaseOrderNoByZpayTradeNo = (db, tradeNo) => {
+export const resolvePurchaseOrderNoByZpayTradeNo = (db, tradeNo) => {
   if (!db) return ''
   const normalized = String(tradeNo || '').trim()
   if (!normalized) return ''
@@ -636,7 +632,7 @@ const getUserIdFromAuthorization = (req) => {
   }
 }
 
-const fetchOrder = (db, orderNo) => {
+export const fetchOrder = (db, orderNo) => {
   const result = db.exec(
     `
 	      SELECT order_no, email, product_name, amount, service_days, order_type, pay_type, status,
@@ -652,7 +648,9 @@ const fetchOrder = (db, orderNo) => {
 	             buyer_reward_points,
 	             buyer_rewarded_at,
                product_key,
-               code_channel
+               code_channel,
+               order_scene,
+               quantity
 	      FROM purchase_orders
 	      WHERE order_no = ?
 	      LIMIT 1
@@ -700,9 +698,167 @@ const fetchOrder = (db, orderNo) => {
 	    buyerRewardPoints: row[35] != null ? Number(row[35]) : null,
 	    buyerRewardedAt: row[36] || null,
       productKey: row[37] || null,
-      codeChannel: row[38] || null
+      codeChannel: row[38] || null,
+      orderScene: normalizeOrderScene(row[39]),
+      quantity: Math.max(1, Number(row[40]) || 1)
 	  }
 	}
+
+const loadReservedLegacyDownstreamCode = (db, order) => {
+  const codeId = Number(order?.codeId || 0)
+  if (!db || !codeId) return []
+
+  const result = db.exec(
+    `
+      SELECT id,
+             code,
+             account_email,
+             COALESCE(NULLIF(LOWER(TRIM(channel)), ''), 'common') AS channel_key,
+             is_redeemed,
+             COALESCE(is_downstream_sold, 0) AS is_downstream_sold,
+             downstream_sold_at,
+             order_type,
+             created_at
+      FROM redemption_codes
+      WHERE id = ?
+      LIMIT 1
+    `,
+    [codeId]
+  )
+
+  const row = result[0]?.values?.[0]
+  if (!row) return []
+
+  return [{
+    codeId: Number(row[0]),
+    code: row[1] ? String(row[1]) : '',
+    accountEmail: row[2] ? String(row[2]).trim() : '',
+    channelKey: row[3] ? String(row[3]).trim().toLowerCase() : 'common',
+    isRedeemed: Number(row[4] || 0) === 1,
+    isDownstreamSold: Number(row[5] || 0) === 1,
+    downstreamSoldAt: row[6] || null,
+    orderType: row[7] ? String(row[7]).trim() : '',
+    createdAt: row[8] || null
+  }]
+}
+
+const finalizeDownstreamPaidOrder = (db, orderNo, order, { paidAt } = {}) => {
+  const quantity = Math.max(1, Number(order?.quantity) || 1)
+  const normalizedPaidAt = normalizeZpayDatetime(paidAt)
+  const existingItems = listDownstreamOrderItems(db, orderNo)
+  const existingItemCodeIds = new Set(existingItems.map(item => item.codeId))
+
+  if (existingItems.length >= quantity) {
+    const codeIds = existingItems.map(item => Number(item.codeId || 0)).filter(codeId => codeId > 0)
+    if (codeIds.length > 0) {
+      const placeholders = codeIds.map(() => '?').join(', ')
+      db.run(
+        `
+          UPDATE redemption_codes
+          SET is_downstream_sold = 1,
+              downstream_sold_at = COALESCE(downstream_sold_at, COALESCE(?, DATETIME('now', 'localtime'))),
+              updated_at = DATETIME('now', 'localtime')
+          WHERE id IN (${placeholders})
+        `,
+        [normalizedPaidAt, ...codeIds]
+      )
+    }
+    db.run(
+      `
+        UPDATE purchase_orders
+        SET invite_status = ?,
+            redeem_error = NULL,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE order_no = ?
+      `,
+      ['下游已售出', orderNo]
+    )
+    return { ok: true, changed: true }
+  }
+
+  let reservedCodes = listReservedRedemptionCodesByOrderNo(db, orderNo)
+  if (!reservedCodes.length) {
+    reservedCodes = loadReservedLegacyDownstreamCode(db, order)
+  }
+
+  const availableCodeIds = new Set([
+    ...Array.from(existingItemCodeIds),
+    ...reservedCodes.map(codeRow => Number(codeRow.codeId || 0)).filter(codeId => codeId > 0)
+  ])
+  if (availableCodeIds.size < quantity) {
+    db.run(
+      `
+        UPDATE purchase_orders
+        SET redeem_error = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE order_no = ?
+      `,
+      ['downstream_reserved_code_mismatch', orderNo]
+    )
+    return { ok: false, changed: true, error: 'downstream_reserved_code_mismatch' }
+  }
+
+  const pendingCodes = []
+  for (const codeRow of reservedCodes) {
+    if (existingItemCodeIds.has(codeRow.codeId)) continue
+    pendingCodes.push(codeRow)
+    if (existingItems.length + pendingCodes.length >= quantity) break
+  }
+
+  const invalidCode = pendingCodes.find(codeRow => codeRow.isRedeemed && !codeRow.isDownstreamSold)
+  if (invalidCode) {
+    db.run(
+      `
+        UPDATE purchase_orders
+        SET redeem_error = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE order_no = ?
+      `,
+      ['该兑换码已被使用', orderNo]
+    )
+    return { ok: false, changed: true, error: 'code_already_redeemed' }
+  }
+
+  if (pendingCodes.length > 0) {
+    const codeIds = pendingCodes.map(codeRow => codeRow.codeId)
+    const placeholders = codeIds.map(() => '?').join(', ')
+    db.run(
+      `
+        UPDATE redemption_codes
+        SET is_downstream_sold = 1,
+            downstream_sold_at = COALESCE(downstream_sold_at, COALESCE(?, DATETIME('now', 'localtime'))),
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id IN (${placeholders})
+          AND is_redeemed = 0
+      `,
+      [normalizedPaidAt, ...codeIds]
+    )
+
+    for (const codeRow of pendingCodes) {
+      db.run(
+        `
+          INSERT INTO downstream_order_items (
+            order_no, code_id, public_code, created_at, updated_at
+          ) VALUES (?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+        `,
+        [orderNo, codeRow.codeId, generateDownstreamPublicCode(db)]
+      )
+    }
+  }
+
+  db.run(
+    `
+      UPDATE purchase_orders
+      SET invite_status = ?,
+          redeem_error = NULL,
+          updated_at = DATETIME('now', 'localtime')
+      WHERE order_no = ?
+    `,
+    ['下游已售出', orderNo]
+  )
+
+  return { ok: true, changed: true }
+}
 
 const computeRefund = ({ amount, startAt, serviceDays }) => {
   const parsedAmount = parseMoney(amount)
@@ -922,7 +1078,22 @@ const persistZpayQueryResult = (db, orderNo, queryResult) => {
 }
 
 const handlePaidOrder = async (db, orderNo, { payType, tradeNo, paidAt, notifyPayload, source }) => {
-  await withLocks([`purchase:${orderNo}`], async () => {
+  const initialOrder = fetchOrder(db, orderNo)
+  const lockKeys = [`purchase:${orderNo}`]
+  if (initialOrder?.orderScene === ORDER_SCENE_DOWNSTREAM) {
+    lockKeys.push('purchase')
+    const codesToLock = listReservedRedemptionCodesByOrderNo(db, orderNo)
+      .map(item => String(item.code || '').trim())
+      .filter(Boolean)
+    if (!codesToLock.length && initialOrder.code) {
+      codesToLock.push(String(initialOrder.code).trim())
+    }
+    for (const code of new Set(codesToLock)) {
+      lockKeys.push(`redemption-code:${code}`)
+    }
+  }
+
+  await withLocks(lockKeys, async () => {
     const order = fetchOrder(db, orderNo)
     if (!order) return
 
@@ -968,10 +1139,17 @@ const handlePaidOrder = async (db, orderNo, { payType, tradeNo, paidAt, notifyPa
 
     const updatedOrder = fetchOrder(db, orderNo)
     if (updatedOrder?.status === 'paid') {
-      awardInvitePointsForPaidOrderLocked(db, orderNo, updatedOrder)
-      awardBuyerPointsForPaidOrderLocked(db, orderNo, updatedOrder)
+      if (updatedOrder.orderScene !== ORDER_SCENE_DOWNSTREAM) {
+        awardInvitePointsForPaidOrderLocked(db, orderNo, updatedOrder)
+        awardBuyerPointsForPaidOrderLocked(db, orderNo, updatedOrder)
+      }
     }
-    if (updatedOrder?.status === 'paid' && !updatedOrder.redeemedAt) {
+    if (updatedOrder?.status === 'paid' && updatedOrder.orderScene === ORDER_SCENE_DOWNSTREAM) {
+      const downstreamResult = finalizeDownstreamPaidOrder(db, orderNo, updatedOrder, { paidAt })
+      if (downstreamResult.changed) {
+        saveDatabase()
+      }
+    } else if (updatedOrder?.status === 'paid' && !updatedOrder.redeemedAt) {
       if (!updatedOrder.code) {
         db.run(
           `UPDATE purchase_orders SET redeem_error = ?, updated_at = DATETIME('now', 'localtime') WHERE order_no = ?`,
@@ -983,12 +1161,14 @@ const handlePaidOrder = async (db, orderNo, { payType, tradeNo, paidAt, notifyPa
           const lockedChannel = updatedOrder.codeChannel
             ? String(updatedOrder.codeChannel).trim().toLowerCase()
             : resolvePurchaseCodeChannel(updatedOrder.orderType)
-          const redemption = await redeemCodeInternal({
-            email: updatedOrder.email,
-            code: updatedOrder.code,
-            channel: lockedChannel,
-            orderType: updatedOrder.orderType
-          })
+          const redemption = await withLocks(['purchase', `redemption-code:${updatedOrder.code}`], () => (
+            redeemCodeInternal({
+              email: updatedOrder.email,
+              code: updatedOrder.code,
+              channel: lockedChannel,
+              orderType: updatedOrder.orderType
+            })
+          ))
           db.run(
             `
               UPDATE purchase_orders
@@ -1070,7 +1250,22 @@ const handlePaidOrder = async (db, orderNo, { payType, tradeNo, paidAt, notifyPa
 
     const orderForEmail = fetchOrder(db, orderNo)
     if (orderForEmail?.email && !orderForEmail.emailSentAt) {
-      const sent = await sendPurchaseOrderEmail(orderForEmail)
+      const emailPayload = { ...orderForEmail }
+      if (orderForEmail.orderScene === ORDER_SCENE_DOWNSTREAM) {
+        const downstreamItems = listDownstreamOrderItems(db, orderNo)
+        const publicBaseUrlSettings = await getPublicBaseUrlSettings(db)
+        const publicBaseUrl = String(publicBaseUrlSettings.baseUrl || '').trim().replace(/\/+$/, '')
+        emailPayload.items = downstreamItems.map(item => ({
+          publicCode: item.publicCode,
+          redeemedAt: item.redeemedAt || null,
+          status: item.redeemedAt ? 'redeemed' : 'unused'
+        }))
+        emailPayload.orderQueryUrl = publicBaseUrl
+          ? `${publicBaseUrl}/downstream/order?orderNo=${encodeURIComponent(orderForEmail.orderNo)}&email=${encodeURIComponent(orderForEmail.email)}`
+          : ''
+      }
+
+      const sent = await sendPurchaseOrderEmail(emailPayload)
       if (sent) {
         db.run(
           `UPDATE purchase_orders SET email_sent_at = DATETIME('now', 'localtime'), updated_at = DATETIME('now', 'localtime') WHERE order_no = ?`,
@@ -1126,15 +1321,14 @@ const shouldSyncOrderWithZpay = (order, { force = false } = {}) => {
   return !last || Number.isNaN(last) || Date.now() - last > minIntervalMs
 }
 
-const syncOrderStatusFromZpay = async (db, orderNo, { force = false } = {}) => {
+export const syncOrderStatusFromZpay = async (db, orderNo, { force = false } = {}) => {
   const order = fetchOrder(db, orderNo)
   if (!order) return { ok: false, reason: 'not_found' }
   if (!shouldSyncOrderWithZpay(order, { force })) return { ok: true, skipped: true }
 
   // 查询时优先仅用 out_trade_no（我方订单号），避免 trade_no 不一致时影响查询结果
   const query = await queryZpayOrder({ tradeNo: '', outTradeNo: orderNo })
-  console.log(query);
-  
+
   try {
     persistZpayQueryResult(db, orderNo, query)
     saveDatabase()
@@ -1396,21 +1590,23 @@ router.post('/orders', async (req, res) => {
       db.run(
         `
           INSERT INTO purchase_orders (
-            user_id, order_no, email, product_key, product_name, amount, service_days, order_type, code_channel, pay_type, status,
-            code_id, code, code_account_email, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+            user_id, order_no, email, product_name, amount, service_days, order_type, order_scene, product_key, code_channel, pay_type, status,
+            quantity, code_id, code, code_account_email, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
         `,
         [
           userIdFromToken,
           orderNo,
           email,
-          product.productKey,
           product.productName,
           product.amount,
           product.serviceDays,
           orderType,
+          ORDER_SCENE_RETAIL,
+          product.productKey,
           lockedChannel,
           payType,
+          1,
           reserved.codeId,
           reserved.code,
           reserved.accountEmail
@@ -1434,7 +1630,7 @@ router.post('/orders', async (req, res) => {
     const productKeyUsed = reservation.product.productKey
 
     // ZPAY 异步通知为 GET，会把支付结果参数拼在 notify_url 后面（示例：/notify?pid=...&trade_no=...）
-    const notifyUrl = `${getPublicBaseUrl(req)}/notify`
+    const notifyUrl = `${await resolvePublicBaseUrl(req, db)}/notify`
 
     const payParams = {
       pid,
@@ -1477,18 +1673,7 @@ router.post('/orders', async (req, res) => {
           `UPDATE purchase_orders SET status = 'failed', refund_message = ?, updated_at = DATETIME('now', 'localtime') WHERE order_no = ?`,
           [msg, orderNo]
         )
-        db.run(
-          `
-            UPDATE redemption_codes
-            SET reserved_for_order_no = NULL,
-                reserved_for_order_email = NULL,
-                reserved_at = NULL,
-                updated_at = DATETIME('now', 'localtime')
-            WHERE reserved_for_order_no = ?
-              AND is_redeemed = 0
-          `,
-          [orderNo]
-        )
+        releaseReservedCodesByOrderNo(db, orderNo)
         saveDatabase()
       })
       return res.status(502).json({ error: msg })
@@ -1516,18 +1701,7 @@ router.post('/orders', async (req, res) => {
           `UPDATE purchase_orders SET status = 'failed', refund_message = ?, updated_at = DATETIME('now', 'localtime') WHERE order_no = ?`,
           [msg, orderNo]
         )
-        db.run(
-          `
-            UPDATE redemption_codes
-            SET reserved_for_order_no = NULL,
-                reserved_for_order_email = NULL,
-                reserved_at = NULL,
-                updated_at = DATETIME('now', 'localtime')
-            WHERE reserved_for_order_no = ?
-              AND is_redeemed = 0
-          `,
-          [orderNo]
-        )
+        releaseReservedCodesByOrderNo(db, orderNo)
         saveDatabase()
       })
       return res.status(502).json({ error: msg })
@@ -1584,18 +1758,7 @@ router.post('/orders', async (req, res) => {
           `UPDATE purchase_orders SET status = 'failed', refund_message = ?, updated_at = DATETIME('now', 'localtime') WHERE order_no = ? AND paid_at IS NULL`,
           [derivedMessage, orderNo]
         )
-        db.run(
-          `
-            UPDATE redemption_codes
-            SET reserved_for_order_no = NULL,
-                reserved_for_order_email = NULL,
-                reserved_at = NULL,
-                updated_at = DATETIME('now', 'localtime')
-            WHERE reserved_for_order_no = ?
-              AND is_redeemed = 0
-          `,
-          [orderNo]
-        )
+        releaseReservedCodesByOrderNo(db, orderNo)
         saveDatabase()
       })
     } catch {
@@ -1813,6 +1976,8 @@ router.get('/orders/:orderNo', async (req, res) => {
         amount: order.amount,
         serviceDays: order.serviceDays,
         orderType: order.orderType,
+        orderScene: order.orderScene,
+        quantity: order.quantity,
         payType: order.payType,
         status: order.status,
         createdAt: order.createdAt,
@@ -1916,44 +2081,46 @@ router.get('/my/orders', authenticateToken, async (req, res) => {
     )
     const total = Number(countResult[0]?.values?.[0]?.[0] || 0)
 
-	    const result = db.exec(
-	      `
-	        SELECT order_no, zpay_trade_no, email, product_name, amount, service_days, order_type, pay_type, status,
-	               created_at, paid_at, redeemed_at, invite_status, redeem_error,
-	               refunded_at, refund_amount, refund_message, email_sent_at, zpay_img
-	        FROM purchase_orders
-	        WHERE user_id = ?
-	        ORDER BY created_at DESC
-	        LIMIT ? OFFSET ?
-	      `,
-	      [userId, pageSize, offset]
-	    )
+    const result = db.exec(
+      `
+        SELECT order_no, zpay_trade_no, email, product_name, amount, service_days, order_type, order_scene, pay_type, status,
+               created_at, paid_at, redeemed_at, invite_status, redeem_error,
+               refunded_at, refund_amount, refund_message, email_sent_at, zpay_img, quantity
+        FROM purchase_orders
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+      `,
+      [userId, pageSize, offset]
+    )
 
     const rows = result[0]?.values || []
-	    res.json({
-	      orders: rows.map(row => ({
-	        orderNo: row[0],
-	        tradeNo: row[1] || null,
-	        email: row[2],
-	        productName: row[3],
-	        amount: row[4],
-	        serviceDays: Number(row[5]) || 30,
-	        orderType: normalizeOrderType(row[6]),
-	        payType: row[7] || null,
-	        img: row[18] || null,
-	        status: row[8],
-	        createdAt: row[9],
-	        paidAt: row[10] || null,
-	        redeemedAt: row[11] || null,
-	        inviteStatus: row[12] || null,
-	        redeemError: row[13] || null,
-	        refundedAt: row[14] || null,
-	        refundAmount: row[15] || null,
-	        refundMessage: row[16] || null,
-	        emailSentAt: row[17] || null
-	      })),
-	      pagination: { page, pageSize, total }
-	    })
+    res.json({
+      orders: rows.map(row => ({
+        orderNo: row[0],
+        tradeNo: row[1] || null,
+        email: row[2],
+        productName: row[3],
+        amount: row[4],
+        serviceDays: Number(row[5]) || 30,
+        orderType: normalizeOrderType(row[6]),
+        orderScene: normalizeOrderScene(row[7]),
+        payType: row[8] || null,
+        img: row[19] || null,
+        status: row[9],
+        createdAt: row[10],
+        paidAt: row[11] || null,
+        redeemedAt: row[12] || null,
+        inviteStatus: row[13] || null,
+        redeemError: row[14] || null,
+        refundedAt: row[15] || null,
+        refundAmount: row[16] || null,
+        refundMessage: row[17] || null,
+        emailSentAt: row[18] || null,
+        quantity: Math.max(1, Number(row[20]) || 1)
+      })),
+      pagination: { page, pageSize, total }
+    })
   } catch (error) {
     console.error('[Purchase] my orders error:', error)
     res.status(500).json({ error: '查询失败，请稍后再试' })
@@ -2004,8 +2171,10 @@ router.post('/my/orders/bind', authenticateToken, async (req, res) => {
       saveDatabase()
 
       const updated = fetchOrder(db, resolvedOrderNo) || current
-      awardInvitePointsForPaidOrderLocked(db, resolvedOrderNo, updated)
-      awardBuyerPointsForPaidOrderLocked(db, resolvedOrderNo, updated)
+      if (updated.orderScene !== ORDER_SCENE_DOWNSTREAM) {
+        awardInvitePointsForPaidOrderLocked(db, resolvedOrderNo, updated)
+        awardBuyerPointsForPaidOrderLocked(db, resolvedOrderNo, updated)
+      }
 
       return { ok: true, message: '关联成功', order: updated }
     })
@@ -2051,10 +2220,34 @@ router.get('/admin/orders', async (req, res) => {
     const offset = (page - 1) * pageSize
     const result = db.exec(
       `
-        SELECT order_no, email, product_name, amount, service_days, order_type, pay_type, status, created_at, paid_at, refunded_at, refund_amount, zpay_payurl
-        FROM purchase_orders
+        SELECT po.order_no,
+               po.email,
+               po.product_name,
+               po.amount,
+               po.service_days,
+               po.order_type,
+               po.order_scene,
+               po.pay_type,
+               po.status,
+               po.created_at,
+               po.paid_at,
+               po.refunded_at,
+               po.refund_amount,
+               po.zpay_payurl,
+               po.quantity,
+               CASE
+                 WHEN COALESCE(NULLIF(TRIM(po.order_scene), ''), 'retail') = 'downstream'
+                   THEN (SELECT COUNT(*) FROM downstream_order_items doi WHERE doi.order_no = po.order_no)
+                 ELSE 0
+               END AS downstream_item_count,
+               CASE
+                 WHEN COALESCE(NULLIF(TRIM(po.order_scene), ''), 'retail') = 'downstream'
+                   THEN (SELECT COUNT(*) FROM downstream_order_items doi WHERE doi.order_no = po.order_no AND doi.redeemed_at IS NOT NULL)
+                 ELSE 0
+               END AS downstream_redeemed_count
+        FROM purchase_orders po
         ${whereClause}
-        ORDER BY created_at DESC
+        ORDER BY po.created_at DESC
         LIMIT ? OFFSET ?
       `,
       [...params, pageSize, offset]
@@ -2068,13 +2261,17 @@ router.get('/admin/orders', async (req, res) => {
         amount: row[3],
         serviceDays: Number(row[4]) || 30,
         orderType: normalizeOrderType(row[5]),
-        payType: row[6] || null,
-        status: row[7],
-        createdAt: row[8],
-        paidAt: row[9] || null,
-        refundedAt: row[10] || null,
-        refundAmount: row[11] || null,
-        payUrl: row[12] || null
+        orderScene: normalizeOrderScene(row[6]),
+        payType: row[7] || null,
+        status: row[8],
+        createdAt: row[9],
+        paidAt: row[10] || null,
+        refundedAt: row[11] || null,
+        refundAmount: row[12] || null,
+        payUrl: row[13] || null,
+        quantity: Math.max(1, Number(row[14]) || 1),
+        downstreamItemCount: Number(row[15] || 0),
+        downstreamRedeemedCount: Number(row[16] || 0)
       })),
       pagination: { page, pageSize, total }
     })

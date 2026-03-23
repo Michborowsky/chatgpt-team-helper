@@ -129,6 +129,13 @@ const getStatusColor = (status?: string) => {
   }
 }
 
+const sceneLabel = (scene?: string) => scene === 'downstream' ? '下游' : '零售'
+const sceneClass = (scene?: string) => (
+  scene === 'downstream'
+    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+    : 'bg-slate-100 text-slate-700 border-slate-200'
+)
+
 const loadOrders = async () => {
   loading.value = true
   error.value = ''
@@ -342,7 +349,20 @@ onUnmounted(() => {
                       </div>
                    </td>
                    <td class="px-6 py-5">
-                      <span class="text-sm font-medium text-gray-900">{{ item.productName }}</span>
+                      <div class="flex flex-col items-start gap-2">
+                        <span class="text-sm font-medium text-gray-900">{{ item.productName }}</span>
+                        <div class="flex flex-wrap items-center gap-2">
+                          <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border" :class="sceneClass(item.orderScene)">
+                            {{ sceneLabel(item.orderScene) }}
+                          </span>
+                          <span class="text-[11px] text-gray-500">
+                            {{ item.quantity || 1 }} 张
+                          </span>
+                          <span v-if="item.orderScene === 'downstream'" class="text-[11px] text-emerald-600">
+                            {{ item.downstreamRedeemedCount || 0 }}/{{ item.downstreamItemCount || item.quantity || 0 }} 已兑
+                          </span>
+                        </div>
+                      </div>
                    </td>
                    <td class="px-6 py-5">
                       <span class="text-sm font-medium text-gray-900">¥ {{ item.amount }}</span>

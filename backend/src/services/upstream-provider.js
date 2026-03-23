@@ -1,6 +1,7 @@
 import axios from 'axios'
 import crypto from 'crypto'
 import { getUpstreamSettings } from '../utils/upstream-settings.js'
+import { getPublicBaseUrlSettings } from '../utils/public-base-url.js'
 
 export const UPSTREAM_PROVIDER_TYPES = {
   LOCAL: 'local',
@@ -69,6 +70,7 @@ const DEFAULT_CUSTOM_HTTP_BODY_TEMPLATE = JSON.stringify({
   userEmail: '{{email}}',
   cardCode: '{{code}}'
 }, null, 2)
+const PLATFORM_UPSTREAM_CHECK_PATH = '/api/upstream/cards/check'
 const PLATFORM_UPSTREAM_REDEEM_PATH = '/api/upstream/cards/redeem'
 
 const resolveCustomRequestUrl = (settings) => {
@@ -303,12 +305,7 @@ async function redeemWithPlatformUpstream(settings, payload) {
     })
   }
 
-  const headers = {
-    Accept: 'application/json, text/plain, */*',
-    'Content-Type': 'application/json',
-    'User-Agent': 'chatgpt-team-helper/upstream-provider',
-    ...(settings.outboundApiKey ? { 'X-Upstream-Key': settings.outboundApiKey } : {})
-  }
+  const headers = await buildPlatformUpstreamHeaders(settings)
 
   try {
     const response = await axios.post(
@@ -394,6 +391,152 @@ async function redeemWithPlatformUpstream(settings, payload) {
   }
 }
 
+const buildPlatformUpstreamHeaders = async (settings) => {
+  const publicBaseUrlSettings = await getPublicBaseUrlSettings()
+  const publicBaseUrl = String(publicBaseUrlSettings.baseUrl || '').trim()
+  let publicOrigin = ''
+  let downstreamDomain = ''
+  if (publicBaseUrl) {
+    try {
+      const parsed = new URL(publicBaseUrl)
+      publicOrigin = parsed.origin
+      downstreamDomain = String(parsed.hostname || '').trim().toLowerCase()
+    } catch {
+      publicOrigin = ''
+      downstreamDomain = ''
+    }
+  }
+
+  return {
+    Accept: 'application/json, text/plain, */*',
+    'Content-Type': 'application/json',
+    'User-Agent': 'chatgpt-team-helper/upstream-provider',
+    ...(settings.outboundApiKey ? { 'X-Upstream-Key': settings.outboundApiKey } : {}),
+    ...(downstreamDomain ? { 'X-Downstream-Domain': downstreamDomain } : {}),
+    ...(publicOrigin ? { Origin: publicOrigin, Referer: `${publicOrigin}/` } : {}),
+  }
+}
+
+async function checkWithPlatformUpstream(settings, payload) {
+  const requestId = crypto.randomUUID()
+  const requestUrl = buildUrl(settings.baseUrl, PLATFORM_UPSTREAM_CHECK_PATH)
+  if (!requestUrl) {
+    return buildProviderResult({
+      ok: false,
+      status: 'failed',
+      retryable: false,
+      providerType: UPSTREAM_PROVIDER_TYPES.PLATFORM_UPSTREAM,
+      supplierName: settings.supplierName,
+      requestId,
+      responseCode: 'CONFIG',
+      message: '服务暂不可用，请联系管理员'
+    })
+  }
+
+  const headers = await buildPlatformUpstreamHeaders(settings)
+
+  try {
+    const response = await axios.post(
+      requestUrl,
+      {
+        code: payload.code,
+        channel: payload.channel || 'common'
+      },
+      {
+        timeout: settings.timeoutMs,
+        headers
+      }
+    )
+
+    const body = response.data || {}
+    const responseRaw = toRawString(body)
+    const status = String(body.status || '').trim().toLowerCase()
+    const message = String(body.message || '').trim()
+
+    if (body.ok === true && status === 'available') {
+      return buildProviderResult({
+        ok: true,
+        status: 'available',
+        retryable: false,
+        providerType: UPSTREAM_PROVIDER_TYPES.PLATFORM_UPSTREAM,
+        supplierName: settings.supplierName,
+        requestId,
+        responseCode: response.status,
+        message: message || '卡密可用',
+        responseRaw,
+        data: body
+      })
+    }
+
+    if (status === 'used') {
+      return buildProviderResult({
+        ok: false,
+        status: 'used',
+        retryable: false,
+        providerType: UPSTREAM_PROVIDER_TYPES.PLATFORM_UPSTREAM,
+        supplierName: settings.supplierName,
+        requestId,
+        responseCode: body.code || response.status,
+        message: message || '卡密已使用',
+        responseRaw,
+        data: body
+      })
+    }
+
+    if (status === 'invalid') {
+      return buildProviderResult({
+        ok: false,
+        status: 'invalid',
+        retryable: false,
+        providerType: UPSTREAM_PROVIDER_TYPES.PLATFORM_UPSTREAM,
+        supplierName: settings.supplierName,
+        requestId,
+        responseCode: body.code || response.status,
+        message: message || '卡密已失效',
+        responseRaw,
+        data: body
+      })
+    }
+
+    return buildProviderResult({
+      ok: false,
+      status: 'failed',
+      retryable: Boolean(body.retryable),
+      providerType: UPSTREAM_PROVIDER_TYPES.PLATFORM_UPSTREAM,
+      supplierName: settings.supplierName,
+      requestId,
+      responseCode: body.code || response.status,
+      message: message || '查询卡密失败，请稍后重试',
+      responseRaw,
+      data: body
+    })
+  } catch (error) {
+    const responseStatus = error.response?.status
+    const responseData = error.response?.data
+    const responseRaw = toRawString(responseData || error.message)
+    const normalizedStatus = String(responseData?.status || '').trim().toLowerCase()
+    const message = String(responseData?.message || responseData?.error || error.message || '').trim()
+    const resolvedStatus = normalizedStatus === 'invalid'
+      ? 'invalid'
+      : normalizedStatus === 'used'
+        ? 'used'
+        : 'failed'
+
+    return buildProviderResult({
+      ok: false,
+      status: resolvedStatus,
+      retryable: resolvedStatus === 'failed',
+      providerType: UPSTREAM_PROVIDER_TYPES.PLATFORM_UPSTREAM,
+      supplierName: settings.supplierName,
+      requestId,
+      responseCode: responseData?.code || responseStatus || 'NETWORK',
+      message: message || '查询卡密失败，请稍后重试',
+      responseRaw,
+      data: responseData
+    })
+  }
+}
+
 export async function redeemViaUpstreamProvider(payload, options = {}) {
   const settings = options.settings || await getUpstreamSettings()
   const readiness = getUpstreamProviderReadiness(settings, options.providerType || settings.providerType)
@@ -416,4 +559,37 @@ export async function redeemViaUpstreamProvider(payload, options = {}) {
   }
 
   return redeemWithCustomHttp(settings, payload)
+}
+
+export async function checkViaUpstreamProvider(payload, options = {}) {
+  const settings = options.settings || await getUpstreamSettings()
+  const readiness = getUpstreamProviderReadiness(settings, options.providerType || settings.providerType)
+
+  if (!readiness.ready) {
+    return buildProviderResult({
+      ok: false,
+      status: 'failed',
+      retryable: false,
+      providerType: readiness.providerType,
+      supplierName: settings.supplierName,
+      requestId: crypto.randomUUID(),
+      responseCode: readiness.responseCode,
+      message: readiness.message
+    })
+  }
+
+  if (readiness.providerType !== UPSTREAM_PROVIDER_TYPES.PLATFORM_UPSTREAM) {
+    return buildProviderResult({
+      ok: false,
+      status: 'failed',
+      retryable: false,
+      providerType: readiness.providerType,
+      supplierName: settings.supplierName,
+      requestId: crypto.randomUUID(),
+      responseCode: 'UNSUPPORTED',
+      message: '当前出站履约类型不支持卡密检查'
+    })
+  }
+
+  return checkWithPlatformUpstream(settings, payload)
 }

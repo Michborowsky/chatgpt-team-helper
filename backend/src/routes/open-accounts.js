@@ -10,6 +10,7 @@ import {
 } from '../services/open-accounts-redemption.js'
 import { withLocks } from '../utils/locks.js'
 import { requireFeatureEnabled } from '../middleware/feature-flags.js'
+import { resolvePublicBaseUrl } from '../utils/public-base-url.js'
 
 const router = express.Router()
 
@@ -176,15 +177,6 @@ const withShortRetry = async ({ enabled, label, uid, accountId, creditOrderNo },
       await sleep(delayMs)
     }
   }
-}
-
-const getPublicBaseUrl = (req) => {
-  const configured = String(process.env.PUBLIC_BASE_URL || '').trim()
-  if (configured) return configured.replace(/\/+$/, '')
-  const protoHeader = req.headers['x-forwarded-proto']
-  const protocol = typeof protoHeader === 'string' && protoHeader.trim() ? protoHeader.split(',')[0].trim() : req.protocol
-  const host = req.get('host')
-  return `https://${host}`
 }
 
 const extractPayingOrderNo = (value) => {
@@ -444,6 +436,7 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
 	                 COUNT(*) AS remaining_codes
 	          FROM redemption_codes
 	          WHERE is_redeemed = 0
+	            AND COALESCE(is_downstream_sold, 0) = 0
 	            AND channel = 'linux-do'
             AND account_email IS NOT NULL
             AND (reserved_for_order_no IS NULL OR reserved_for_order_no = '')
@@ -504,6 +497,7 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
 	            SELECT COUNT(*)
 	            FROM redemption_codes
 	            WHERE is_redeemed = 0
+	              AND COALESCE(is_downstream_sold, 0) = 0
 	              AND channel = 'linux-do'
 	              AND account_email IS NOT NULL
 	              AND lower(trim(account_email)) = ?
@@ -971,7 +965,7 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
         return res.status(500).json({ error: '创建 Credit 订单失败' })
       }
 
-      const notifyUrl = `${getPublicBaseUrl(req)}/credit/notify`
+      const notifyUrl = `${await resolvePublicBaseUrl(req, db)}/credit/notify`
 
       if (!creditPid || !creditKey || !creditBaseUrl) {
         return res.status(500).json({ error: '未配置 Linux DO Credit 凭据' })

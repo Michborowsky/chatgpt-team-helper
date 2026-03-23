@@ -39,6 +39,7 @@ router.get('/runtime', async (req, res) => {
         redeemMode: channel.redeemMode,
         providerType: channel.providerType,
         allowCommonFallback: channel.allowCommonFallback,
+        allowDownstreamSale: channel.allowDownstreamSale,
         isActive: channel.isActive,
         isBuiltin: channel.isBuiltin,
         sortOrder: channel.sortOrder,

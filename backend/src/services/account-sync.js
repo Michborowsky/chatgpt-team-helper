@@ -1,6 +1,6 @@
 import { getDatabase, saveDatabase } from '../database/init.js'
 import axios from 'axios'
-import { loadProxyList, parseProxyConfig, pickProxyByHash } from '../utils/proxy.js'
+import { buildAxiosProxyOptions, loadDefaultProxyList, normalizeProxyConfig, pickProxyByHash } from '../utils/proxy.js'
 import { buildChatgptAdminHeaders, getAccountChatgptId, CHATGPT_OAI_CLIENT_VERSION } from './account-client-profile.js'
 
 export class AccountSyncError extends Error {
@@ -11,52 +11,16 @@ export class AccountSyncError extends Error {
   }
 }
 
-const DEFAULT_PROXY_CACHE_TTL_MS = 60_000
-let defaultProxyCache = { loadedAt: 0, proxies: [] }
+const getDefaultProxyList = async () => loadDefaultProxyList()
 
-const getDefaultProxyList = () => {
-  const now = Date.now()
-  if (defaultProxyCache.loadedAt && (now - defaultProxyCache.loadedAt) < DEFAULT_PROXY_CACHE_TTL_MS) {
-    return defaultProxyCache.proxies
-  }
-
-  const proxies = loadProxyList()
-  defaultProxyCache = { loadedAt: now, proxies }
-  return proxies
-}
-
-const pickProxyFromEnv = () => {
-  const candidates = [
-    process.env.CHATGPT_PROXY_URL,
-    process.env.CHATGPT_PROXY,
-    process.env.ALL_PROXY,
-    process.env.all_proxy,
-    process.env.HTTPS_PROXY,
-    process.env.https_proxy,
-    process.env.HTTP_PROXY,
-    process.env.http_proxy
-  ]
-
-  for (const candidate of candidates) {
-    const normalized = String(candidate || '').trim()
-    if (!normalized) continue
-    const config = parseProxyConfig(normalized)
-    if (config) {
-      return { url: normalized, config }
-    }
-  }
-
-  return null
-}
-
-const resolveRequestProxy = (proxy, { key, attempt } = {}) => {
+const resolveRequestProxy = async (proxy, { key, attempt } = {}) => {
   if (proxy === false) return false
 
   const rawString = typeof proxy === 'string' ? String(proxy).trim() : ''
   if (rawString) return rawString
   if (proxy && typeof proxy === 'object') return proxy
 
-  const entry = pickProxyByHash(getDefaultProxyList(), key, { attempt }) || pickProxyFromEnv()
+  const entry = pickProxyByHash(await getDefaultProxyList(), key, { attempt })
   return entry ? entry.url : null
 }
 
@@ -121,33 +85,6 @@ export async function fetchAllAccounts() {
   return result[0].values.map(mapRowToAccount)
 }
 
-const normalizeProxyConfig = (proxy) => {
-  if (!proxy) return null
-  if (typeof proxy === 'string') return parseProxyConfig(proxy)
-  if (typeof proxy === 'object' && proxy.host && proxy.port) {
-    const protocol = proxy.protocol ? String(proxy.protocol).replace(':', '').toLowerCase() : 'http'
-    if (!['http', 'https', 'socks', 'socks4', 'socks4a', 'socks5', 'socks5h'].includes(protocol)) return null
-    const port = Number(proxy.port)
-    if (!Number.isFinite(port) || port <= 0) return null
-
-    const auth = proxy.auth && typeof proxy.auth === 'object'
-      ? {
-          username: proxy.auth.username ? String(proxy.auth.username) : '',
-          password: proxy.auth.password ? String(proxy.auth.password) : ''
-        }
-      : undefined
-
-    return {
-      protocol,
-      host: String(proxy.host),
-      port,
-      ...(auth && auth.username ? { auth } : {})
-    }
-  }
-
-  return null
-}
-
 const formatProxyConfigForLog = (proxyConfig) => {
   if (!proxyConfig) return null
   return {
@@ -157,80 +94,21 @@ const formatProxyConfigForLog = (proxyConfig) => {
   }
 }
 
-const isSocksProxyConfig = (proxyConfig) => {
-  if (!proxyConfig) return false
-  const protocol = String(proxyConfig.protocol || '').toLowerCase()
-  return protocol === 'socks' || protocol.startsWith('socks')
-}
-
-const buildProxyUrlFromConfig = (proxyConfig) => {
-  if (!proxyConfig) return ''
-  const protocol = String(proxyConfig.protocol || '').replace(':', '')
-  const host = String(proxyConfig.host || '')
-  const port = Number(proxyConfig.port || 0)
-  if (!protocol || !host || !Number.isFinite(port) || port <= 0) return ''
-
-  const auth = proxyConfig.auth && typeof proxyConfig.auth === 'object'
-    ? {
-        username: proxyConfig.auth.username ? String(proxyConfig.auth.username) : '',
-        password: proxyConfig.auth.password ? String(proxyConfig.auth.password) : ''
-      }
-    : null
-
-  const authPart = auth && auth.username
-    ? `${encodeURIComponent(auth.username)}:${encodeURIComponent(auth.password || '')}@`
-    : ''
-
-  return `${protocol}://${authPart}${host}:${port}`
-}
-
-let socksProxyAgentModulePromise = null
-const socksAgentCache = new Map()
-
-async function getSocksProxyAgentModule() {
-  if (!socksProxyAgentModulePromise) {
-    socksProxyAgentModulePromise = import('socks-proxy-agent')
-  }
-  return socksProxyAgentModulePromise
-}
-
-async function getSocksAgent(proxyUrl, proxyConfigForLog) {
-  const url = String(proxyUrl || '').trim()
-  if (!url) return null
-
-  const cached = socksAgentCache.get(url)
-  if (cached) return cached
-
-  let module
-  try {
-    module = await getSocksProxyAgentModule()
-  } catch (error) {
-    console.error('SOCKS 代理依赖缺失（socks-proxy-agent）', {
-      proxy: formatProxyConfigForLog(proxyConfigForLog),
-      message: error?.message || String(error)
-    })
-    throw new AccountSyncError('SOCKS5 代理需要安装依赖 socks-proxy-agent（请在 backend 执行 npm i socks-proxy-agent）', 500)
-  }
-
-  const SocksProxyAgent = module?.SocksProxyAgent || module?.default
-  if (!SocksProxyAgent) {
-    throw new AccountSyncError('SOCKS5 代理依赖 socks-proxy-agent 加载失败', 500)
-  }
-
-  const agent = new SocksProxyAgent(url)
-  socksAgentCache.set(url, agent)
-  return agent
-}
-
 async function requestChatgptText(apiUrl, { method, headers, data, proxy } = {}, logContext = {}) {
   const proxyKey = logContext?.accountId ?? logContext?.chatgptAccountId ?? ''
-  const resolvedProxy = resolveRequestProxy(proxy, { key: proxyKey })
-  const rawProxyUrl = typeof resolvedProxy === 'string' ? String(resolvedProxy).trim() : ''
+  const resolvedProxy = await resolveRequestProxy(proxy, { key: proxyKey })
   const proxyConfig = normalizeProxyConfig(resolvedProxy)
-  const socksProxyUrl = proxyConfig && isSocksProxyConfig(proxyConfig)
-    ? (rawProxyUrl || buildProxyUrlFromConfig(proxyConfig))
-    : ''
-  const socksAgent = socksProxyUrl ? await getSocksAgent(socksProxyUrl, proxyConfig) : null
+  let axiosProxyOptions
+  try {
+    axiosProxyOptions = await buildAxiosProxyOptions(resolvedProxy)
+  } catch (error) {
+    console.error('初始化代理失败', {
+      ...logContext,
+      proxy: formatProxyConfigForLog(proxyConfig),
+      message: error?.message || String(error)
+    })
+    throw new AccountSyncError(error?.message || '代理初始化失败', 500)
+  }
 
   let response
   try {
@@ -240,9 +118,7 @@ async function requestChatgptText(apiUrl, { method, headers, data, proxy } = {},
       headers,
       data,
       timeout: 60000,
-      proxy: socksAgent ? false : (proxyConfig || false),
-      httpAgent: socksAgent || undefined,
-      httpsAgent: socksAgent || undefined,
+      ...axiosProxyOptions,
       responseType: 'text',
       transformResponse: [d => d],
       validateStatus: () => true

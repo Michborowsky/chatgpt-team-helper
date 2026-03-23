@@ -3,6 +3,7 @@ import crypto from 'crypto'
 import axios from 'axios'
 import { apiKeyAuth } from '../middleware/api-key-auth.js'
 import { setOAuthSession, getOAuthSession, deleteOAuthSession } from '../services/oauth-session-store.js'
+import { buildAxiosProxyOptions, formatProxyForLog, loadDefaultProxyList, normalizeProxyConfig, pickProxyByHash } from '../utils/proxy.js'
 
 const router = express.Router()
 
@@ -12,36 +13,6 @@ const OPENAI_CONFIG = {
   REDIRECT_URI: 'http://localhost:1455/auth/callback',
   SCOPE: 'openid email profile offline_access',
   PROMPT: 'login'
-}
-
-function parseProxyConfig(proxyUrl) {
-  if (!proxyUrl) return null
-
-  try {
-    const parsed = new URL(proxyUrl)
-    if (!parsed.hostname) {
-      return null
-    }
-
-    const port = parsed.port ? Number(parsed.port) : parsed.protocol === 'https:' ? 443 : 80
-
-    const auth = parsed.username
-      ? {
-          username: decodeURIComponent(parsed.username),
-          password: decodeURIComponent(parsed.password || '')
-        }
-      : undefined
-
-    return {
-      protocol: parsed.protocol?.replace(':', '') || 'http',
-      host: parsed.hostname,
-      port,
-      auth
-    }
-  } catch (error) {
-    console.warn('Invalid proxy url provided for OpenAI OAuth:', error.message)
-    return null
-  }
 }
 
 function decodeJwtPayload(token) {
@@ -105,10 +76,21 @@ function buildOpenAIOAuthExchangeErrorMessage(error) {
 router.post('/generate-auth-url', apiKeyAuth, async (req, res) => {
   try {
     const { proxy } = req.body || {}
+    const explicitProxy = typeof proxy === 'string' ? proxy.trim() : ''
+    if (explicitProxy && !normalizeProxyConfig(explicitProxy)) {
+      return res.status(400).json({
+        success: false,
+        message: '代理地址格式不正确'
+      })
+    }
 
     const pkce = generateOpenAIPKCE()
     const state = crypto.randomBytes(32).toString('hex')
     const sessionId = crypto.randomUUID()
+    const defaultProxyEntry = explicitProxy
+      ? null
+      : pickProxyByHash(await loadDefaultProxyList(), sessionId)
+    const resolvedProxy = explicitProxy || defaultProxyEntry?.url || null
 
     const createdAt = new Date()
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000)
@@ -117,7 +99,7 @@ router.post('/generate-auth-url', apiKeyAuth, async (req, res) => {
       codeVerifier: pkce.codeVerifier,
       codeChallenge: pkce.codeChallenge,
       state,
-      proxy: proxy || null,
+      proxy: resolvedProxy,
       platform: 'openai',
       createdAt: createdAt.toISOString(),
       expiresAt: expiresAt.toISOString()
@@ -143,7 +125,8 @@ router.post('/generate-auth-url', apiKeyAuth, async (req, res) => {
       redirectUri: OPENAI_CONFIG.REDIRECT_URI,
       scope: OPENAI_CONFIG.SCOPE,
       prompt: OPENAI_CONFIG.PROMPT,
-      hasProxy: !!proxy
+      hasProxy: Boolean(resolvedProxy),
+      proxy: resolvedProxy ? formatProxyForLog(resolvedProxy) : null
     })
 
     return res.json({
@@ -204,21 +187,23 @@ router.post('/exchange-code', apiKeyAuth, async (req, res) => {
       code_verifier: sessionData.codeVerifier
     }).toString()
 
+    const resolvedProxy = String(sessionData.proxy || '').trim()
+      || (pickProxyByHash(await loadDefaultProxyList(), sessionId)?.url || '')
+    const proxyConfig = normalizeProxyConfig(resolvedProxy)
+    const axiosProxyOptions = await buildAxiosProxyOptions(resolvedProxy)
+
     const axiosConfig = {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded'
       },
-      timeout: 60000
-    }
-
-    const proxyConfig = parseProxyConfig(sessionData.proxy)
-    if (proxyConfig) {
-      axiosConfig.proxy = proxyConfig
+      timeout: 60000,
+      ...axiosProxyOptions
     }
 
     console.log('Exchanging OpenAI authorization code', {
       sessionId,
       hasProxy: !!proxyConfig,
+      proxy: resolvedProxy ? formatProxyForLog(resolvedProxy) : null,
       codeLength: String(code).length,
       redirectUri: OPENAI_CONFIG.REDIRECT_URI
     })

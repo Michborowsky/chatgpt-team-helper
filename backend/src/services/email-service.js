@@ -31,6 +31,13 @@ const buildSmtpConfig = (settings) => {
   }
 }
 
+const escapeHtml = (value) => String(value ?? '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;')
+
 export async function sendAdminAlertEmail({ subject, text, html } = {}) {
   const settings = await getSmtpSettings()
   const smtpConfig = buildSmtpConfig(settings)
@@ -202,10 +209,97 @@ export async function sendPurchaseOrderEmail(order) {
 
   const transporter = nodemailer.createTransport(smtpConfig)
   const from = String(settings?.smtp?.from || '').trim() || smtpConfig.auth.user
-  const subject = process.env.PURCHASE_EMAIL_SUBJECT || '订单信息'
 
   const orderNo = String(order?.orderNo || '')
   const serviceDays = Number(order?.serviceDays || 30)
+  const orderScene = String(order?.orderScene || 'retail').trim().toLowerCase()
+  const productName = String(order?.productName || '').trim()
+  const amount = String(order?.amount || '').trim()
+  const quantity = Math.max(1, Number(order?.quantity) || 1)
+  const payType = String(order?.payType || '').trim()
+  const paidAt = String(order?.paidAt || '').trim()
+  const orderQueryUrl = String(order?.orderQueryUrl || '').trim()
+  const downstreamItems = Array.isArray(order?.items) ? order.items : []
+
+  const isDownstreamOrder = orderScene === 'downstream'
+  const subject = isDownstreamOrder
+    ? (process.env.DOWNSTREAM_PURCHASE_EMAIL_SUBJECT || process.env.PURCHASE_EMAIL_SUBJECT || '下游订单信息')
+    : (process.env.PURCHASE_EMAIL_SUBJECT || '订单信息')
+
+  if (isDownstreamOrder) {
+    const itemLines = downstreamItems.length > 0
+      ? downstreamItems.map((item, index) => {
+        const code = String(item?.publicCode || '').trim()
+        const redeemedAt = String(item?.redeemedAt || '').trim()
+        return `${index + 1}. ${code}${redeemedAt ? `（已兑换：${redeemedAt}）` : ''}`
+      })
+      : ['订单已支付，兑换码正在准备中，请稍后通过订单查询页查看。']
+
+    const text = [
+      '下游订单支付成功',
+      `订单号：${orderNo}`,
+      `邮箱：${to}`,
+      ...(productName ? [`商品：${productName}`] : []),
+      `数量：${quantity}`,
+      ...(amount ? [`总金额：${amount}`] : []),
+      ...(payType ? [`支付方式：${payType}`] : []),
+      ...(paidAt ? [`支付时间：${paidAt}`] : []),
+      '',
+      '订单内容：',
+      ...itemLines,
+      ...(orderQueryUrl ? ['', `订单查询：${orderQueryUrl}`] : [])
+    ].join('\n')
+
+    const itemsHtml = downstreamItems.length > 0
+      ? downstreamItems.map((item, index) => {
+        const code = escapeHtml(String(item?.publicCode || '').trim())
+        const redeemedAt = escapeHtml(String(item?.redeemedAt || '').trim())
+        return `
+          <li style="margin: 0 0 10px;">
+            <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 15px; font-weight: 700; color: #111827;">
+              ${index + 1}. ${code}
+            </div>
+            <div style="margin-top: 4px; color: #6b7280; font-size: 13px;">
+              ${redeemedAt ? `已兑换：${redeemedAt}` : '等待终端买家兑换'}
+            </div>
+          </li>
+        `
+      }).join('')
+      : '<li style="color:#6b7280;">订单已支付，兑换码正在准备中，请稍后通过订单查询页查看。</li>'
+
+    const html = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; line-height: 1.6;">
+        <h2 style="margin: 0 0 12px;">下游订单支付成功</h2>
+        <p style="margin: 0 0 6px;">订单号：<strong>${escapeHtml(orderNo)}</strong></p>
+        <p style="margin: 0 0 6px;">邮箱：${escapeHtml(to)}</p>
+        ${productName ? `<p style="margin: 0 0 6px;">商品：${escapeHtml(productName)}</p>` : ''}
+        <p style="margin: 0 0 6px;">数量：${quantity}</p>
+        ${amount ? `<p style="margin: 0 0 6px;">总金额：${escapeHtml(amount)}</p>` : ''}
+        ${payType ? `<p style="margin: 0 0 6px;">支付方式：${escapeHtml(payType)}</p>` : ''}
+        ${paidAt ? `<p style="margin: 0 0 12px;">支付时间：${escapeHtml(paidAt)}</p>` : '<div style="height:12px;"></div>'}
+        <div style="margin: 16px 0 10px; font-weight: 700;">订单内容</div>
+        <ol style="margin: 0; padding-left: 20px;">
+          ${itemsHtml}
+        </ol>
+        ${orderQueryUrl ? `<p style="margin: 16px 0 0;"><a href="${escapeHtml(orderQueryUrl)}" style="color:#2563eb;text-decoration:none;">打开订单查询页</a></p>` : ''}
+      </div>
+    `
+
+    try {
+      await transporter.sendMail({
+        from,
+        to,
+        subject,
+        text,
+        html,
+      })
+      console.log('[Purchase] downstream order email sent', { orderNo, itemCount: downstreamItems.length })
+      return true
+    } catch (error) {
+      console.warn('[Purchase] send downstream order email failed', error?.message || error)
+      return false
+    }
+  }
 
   const text = [
     `订单号：${orderNo}`,

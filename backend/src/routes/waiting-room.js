@@ -5,6 +5,7 @@ import { requireMenu } from '../middleware/rbac.js'
 import { authenticateLinuxDoSession } from '../middleware/linuxdo-session.js'
 import { verifyTurnstileToken, isTurnstileEnabled } from '../utils/turnstile.js'
 import { redeemCodeInternal, RedemptionError } from './redemption-codes.js'
+import { withLocks } from '../utils/locks.js'
 
 const router = express.Router()
 
@@ -683,12 +684,14 @@ router.post('/admin/entries/:id/redeem', async (req, res) => {
       return res.status(400).json({ error: '该记录未配置有效邮箱' })
     }
 
-    const result = await redeemCodeInternal({
-      email: entry.email,
-      code: entry.reservedCode,
-      channel: 'linux-do',
-      redeemerUid: entry.linuxDoUid
-    })
+    const result = await withLocks(['purchase', `redemption-code:${entry.reservedCode}`], () => (
+      redeemCodeInternal({
+        email: entry.email,
+        code: entry.reservedCode,
+        channel: 'linux-do',
+        redeemerUid: entry.linuxDoUid
+      })
+    ))
 
     const updatedEntry = fetchEntryById(db, entryId)
     return res.json({

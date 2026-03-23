@@ -1,4 +1,5 @@
 import { redeemCodeInternal, RedemptionError } from '../routes/redemption-codes.js'
+import { withLocks } from '../utils/locks.js'
 
 const DEFAULT_OPEN_ACCOUNTS_CHANNELS = ['linux-do']
 const OPEN_ACCOUNTS_ALLOWED_CHANNELS = new Set(['common', 'linux-do'])
@@ -33,9 +34,10 @@ export const reserveOpenAccountsCode = (db, { orderNo, accountEmail, email }) =>
   const normalizedAccount = normalizeEmail(accountEmail)
   const result = db.exec(
     `
-      SELECT id, code, account_email, channel, is_redeemed, redeemed_by
+	      SELECT id, code, account_email, channel, is_redeemed, redeemed_by
 	      FROM redemption_codes
 	      WHERE is_redeemed = 0
+	        AND COALESCE(is_downstream_sold, 0) = 0
 	        AND account_email IS NOT NULL
 	        AND lower(trim(account_email)) = ?
 	        AND channel IN (${placeholders})
@@ -61,6 +63,7 @@ export const reserveOpenAccountsCode = (db, { orderNo, accountEmail, email }) =>
           updated_at = DATETIME('now', 'localtime')
       WHERE id = ?
         AND is_redeemed = 0
+        AND COALESCE(is_downstream_sold, 0) = 0
         AND (reserved_for_order_no IS NULL OR reserved_for_order_no = '')
     `,
     [orderNo, normalizeEmail(email), codeInfo.id]
@@ -158,6 +161,7 @@ export const releaseOpenAccountsOrderCode = (db, orderNo) => {
           updated_at = DATETIME('now', 'localtime')
       WHERE reserved_for_order_no = ?
         AND is_redeemed = 0
+        AND COALESCE(is_downstream_sold, 0) = 0
     `,
     [orderNo]
   )
@@ -176,21 +180,32 @@ export const releaseOpenAccountsOrderCode = (db, orderNo) => {
 }
 
 export const redeemOpenAccountsOrderCode = async (db, { orderNo, uid, email, accountEmail, capacityLimit = 5, orderType }) => {
-  const codeInfo = ensureOpenAccountsOrderCode(db, { orderNo, accountEmail, email })
-  if (!codeInfo?.code) {
-    return { ok: false, error: 'no_code' }
-  }
-
   try {
-    const redemption = await redeemCodeInternal({
-      email,
-      code: codeInfo.code,
-      channel: codeInfo.channel || 'common',
-      orderType,
-      redeemerUid: uid,
-      capacityLimit
+    return await withLocks(['purchase'], async () => {
+      const codeInfo = ensureOpenAccountsOrderCode(db, { orderNo, accountEmail, email })
+      if (!codeInfo?.code) {
+        return { ok: false, error: 'no_code' }
+      }
+
+      try {
+        const redemption = await withLocks([`redemption-code:${codeInfo.code}`], () => (
+          redeemCodeInternal({
+            email,
+            code: codeInfo.code,
+            channel: codeInfo.channel || 'common',
+            orderType,
+            redeemerUid: uid,
+            capacityLimit
+          })
+        ))
+        return { ok: true, redemption, code: codeInfo }
+      } catch (error) {
+        if (error instanceof RedemptionError) {
+          return { ok: false, error: error.message, statusCode: error.statusCode || 400 }
+        }
+        return { ok: false, error: error?.message || 'redeem_failed', statusCode: 500 }
+      }
     })
-    return { ok: true, redemption, code: codeInfo }
   } catch (error) {
     if (error instanceof RedemptionError) {
       return { ok: false, error: error.message, statusCode: error.statusCode || 400 }

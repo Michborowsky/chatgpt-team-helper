@@ -10,7 +10,8 @@ const CONFIG_KEYS = [
   'upstream_outbound_api_key',
   'upstream_timeout_ms',
   'upstream_api_enabled',
-  'upstream_api_key'
+  'upstream_api_key',
+  'upstream_inbound_clients'
 ]
 
 const DEFAULT_CUSTOM_BODY_TEMPLATE = JSON.stringify({
@@ -28,7 +29,8 @@ const DEFAULTS = {
   outboundApiKey: '',
   timeoutMs: 15000,
   apiEnabled: false,
-  apiKey: ''
+  apiKey: '',
+  inboundClients: []
 }
 
 const CACHE_TTL_MS = 60 * 1000
@@ -58,6 +60,63 @@ const normalizeBaseUrl = (value) => {
   const raw = String(value || '').trim()
   return raw.replace(/\/+$/, '')
 }
+
+export const normalizeUpstreamPeerDomain = (value) => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (!raw || raw === '*' || raw === 'default') return ''
+
+  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw)
+    ? raw
+    : `https://${raw}`
+
+  try {
+    const parsed = new URL(candidate)
+    return String(parsed.hostname || '').trim().toLowerCase().replace(/\.+$/, '')
+  } catch {
+    return ''
+  }
+}
+
+const normalizeInboundClientId = (value) => String(value || '').trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80)
+
+const normalizeInboundClientEntry = (entry, fallbackId = '') => {
+  const domain = normalizeUpstreamPeerDomain(entry?.domain ?? entry?.hostname ?? entry?.downstreamDomain ?? entry?.downstream_domain)
+  const apiKey = String(entry?.apiKey ?? entry?.api_key ?? entry?.key ?? '').trim()
+  const id = normalizeInboundClientId(entry?.id) || normalizeInboundClientId(fallbackId)
+
+  return {
+    id,
+    domain,
+    apiKey,
+  }
+}
+
+export const parseUpstreamInboundClients = (value) => {
+  if (value == null) return []
+
+  let parsed = value
+  if (typeof parsed === 'string') {
+    const raw = parsed.trim()
+    if (!raw) return []
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return []
+    }
+  }
+
+  if (!Array.isArray(parsed)) return []
+
+  return parsed
+    .map((entry, index) => normalizeInboundClientEntry(entry, `inbound_${index + 1}`))
+    .filter(entry => entry.domain || entry.apiKey || entry.id)
+}
+
+export const stringifyUpstreamInboundClients = (clients) => JSON.stringify(
+  (Array.isArray(clients) ? clients : [])
+    .map((entry, index) => normalizeInboundClientEntry(entry, `inbound_${index + 1}`))
+    .filter(entry => entry.domain || entry.apiKey)
+)
 
 const normalizeProviderType = (value, fallback = DEFAULTS.providerType) => {
   const normalized = String(value || '').trim().toLowerCase()
@@ -93,7 +152,10 @@ export const getUpstreamSettingsFromEnv = () => ({
   outboundApiKey: String(process.env.UPSTREAM_OUTBOUND_API_KEY || DEFAULTS.outboundApiKey).trim(),
   timeoutMs: clampInteger(process.env.UPSTREAM_TIMEOUT_MS, { min: 1000, max: 120000, fallback: DEFAULTS.timeoutMs }),
   apiEnabled: parseBool(process.env.UPSTREAM_API_ENABLED, DEFAULTS.apiEnabled),
-  apiKey: String(process.env.UPSTREAM_API_KEY || DEFAULTS.apiKey).trim()
+  apiKey: String(process.env.UPSTREAM_API_KEY || DEFAULTS.apiKey).trim(),
+  inboundClients: parseUpstreamInboundClients(
+    process.env.UPSTREAM_INBOUND_CLIENTS || process.env.UPSTREAM_API_KEYS_BY_DOMAIN || ''
+  )
 })
 
 export const invalidateUpstreamSettingsCache = () => {
@@ -134,6 +196,9 @@ export async function getUpstreamSettings(db, { forceRefresh = false } = {}) {
   })
   const apiEnabled = parseBool(resolveString('upstream_api_enabled', env.apiEnabled), env.apiEnabled)
   const apiKey = String(resolveString('upstream_api_key', env.apiKey) ?? '').trim()
+  const inboundClients = stored.has('upstream_inbound_clients')
+    ? parseUpstreamInboundClients(stored.get('upstream_inbound_clients'))
+    : env.inboundClients
 
   cachedSettings = {
     providerEnabled,
@@ -146,6 +211,7 @@ export async function getUpstreamSettings(db, { forceRefresh = false } = {}) {
     timeoutMs,
     apiEnabled,
     apiKey,
+    inboundClients,
     stored: {
       providerEnabled: stored.has('upstream_provider_enabled'),
       providerType: stored.has('upstream_provider_type'),
@@ -156,7 +222,8 @@ export async function getUpstreamSettings(db, { forceRefresh = false } = {}) {
       outboundApiKey: stored.has('upstream_outbound_api_key') && Boolean(String(stored.get('upstream_outbound_api_key') ?? '').trim()),
       timeoutMs: stored.has('upstream_timeout_ms'),
       apiEnabled: stored.has('upstream_api_enabled'),
-      apiKey: stored.has('upstream_api_key') && Boolean(String(stored.get('upstream_api_key') ?? '').trim())
+      apiKey: stored.has('upstream_api_key') && Boolean(String(stored.get('upstream_api_key') ?? '').trim()),
+      inboundClients: stored.has('upstream_inbound_clients')
     }
   }
   cachedAt = now

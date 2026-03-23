@@ -162,6 +162,7 @@ export function selectRecoveryCode(
       FROM redemption_codes rc
       JOIN gpt_accounts ga ON lower(trim(ga.email)) = lower(trim(rc.account_email))
       WHERE rc.is_redeemed = 0
+        AND COALESCE(rc.is_downstream_sold, 0) = 0
         AND rc.account_email IS NOT NULL
         AND trim(rc.account_email) != ''
         AND COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'

@@ -32,7 +32,7 @@ import { requireFeatureEnabled } from '../middleware/feature-flags.js'
 import { getChannels, normalizeChannelKey } from '../utils/channels.js'
 import { resolveOrderDeadlineMs, selectRecoveryCode } from '../services/account-recovery.js'
 import { getAccountRecoverySettings } from '../utils/account-recovery-settings.js'
-import { redeemViaUpstreamProvider } from '../services/upstream-provider.js'
+import { checkViaUpstreamProvider, redeemViaUpstreamProvider } from '../services/upstream-provider.js'
 
 const router = express.Router()
 
@@ -200,8 +200,10 @@ const mapCodeRow = (row, channelsByKey) => {
   const channelValue = normalizeChannel(row[6], 'common')
   const storedChannelName = row[7] == null ? '' : String(row[7]).trim()
   const channelName = storedChannelName || resolveChannelNameFromRegistry(channelsByKey, channelValue) || channelValue
-  const hasAccountIsBannedColumn = row.length >= 26
-  const supplierBaseIndex = hasAccountIsBannedColumn ? 18 : 17
+  const hasAccountIsBannedColumn = row.length >= 28
+  const downstreamBaseIndex = 17
+  const accountIsBannedIndex = hasAccountIsBannedColumn ? 19 : -1
+  const supplierBaseIndex = hasAccountIsBannedColumn ? 20 : 19
   return {
     id: row[0],
     code: row[1],
@@ -220,8 +222,10 @@ const mapCodeRow = (row, channelsByKey) => {
     reservedForOrderNo: row.length > 14 ? row[14] || null : null,
     reservedForOrderEmail: row.length > 15 ? row[15] || null : null,
     orderType: row.length > 16 ? row[16] || null : null,
+    isDownstreamSold: row.length > downstreamBaseIndex ? toInt(row[downstreamBaseIndex], 0) === 1 : false,
+    downstreamSoldAt: row.length > downstreamBaseIndex + 1 ? row[downstreamBaseIndex + 1] || null : null,
     // Optional: may be present when list API joins gpt_accounts.
-    accountIsBanned: hasAccountIsBannedColumn ? toInt(row[17], 0) === 1 : undefined,
+    accountIsBanned: hasAccountIsBannedColumn ? toInt(row[accountIsBannedIndex], 0) === 1 : undefined,
     fulfillmentMode: row.length > supplierBaseIndex ? String(row[supplierBaseIndex] ?? '').trim() || 'internal_invite' : 'internal_invite',
     supplierName: row.length > supplierBaseIndex + 1 ? row[supplierBaseIndex + 1] || null : null,
     supplierType: row.length > supplierBaseIndex + 2 ? row[supplierBaseIndex + 2] || null : null,
@@ -236,11 +240,13 @@ const mapCodeRow = (row, channelsByKey) => {
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const CODE_REGEX = /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/
 const OUT_OF_STOCK_MESSAGE = '暂无可用兑换码，请联系管理员补货'
+export const DOWNSTREAM_SOLD_MESSAGE = '该兑换码已通过下游售出，不可在本平台兑换'
 const FULFILLMENT_MODE_INTERNAL = 'internal_invite'
 const FULFILLMENT_MODE_EXTERNAL = 'external_api'
 const SUPPLIER_STATUS_PENDING = 'pending'
 const SUPPLIER_STATUS_PROCESSING = 'processing'
 const SUPPLIER_STATUS_SUCCESS = 'success'
+const SUPPLIER_STATUS_USED = 'used'
 const SUPPLIER_STATUS_INVALID = 'invalid'
 const SUPPLIER_STATUS_FAILED = 'failed'
 const extractEmailFromRedeemedBy = (redeemedBy) => {
@@ -429,6 +435,49 @@ const updateExternalSupplierCodeResult = (db, codeId, values) => {
   )
 }
 
+const updateExternalSupplierCheckResult = (db, codeId, values) => {
+  db.run(
+    `
+      UPDATE redemption_codes
+      SET fulfillment_mode = ?,
+          supplier_name = ?,
+          supplier_type = ?,
+          supplier_request_id = ?,
+          supplier_status = ?,
+          supplier_response_code = ?,
+          supplier_response_message = ?,
+          supplier_response_raw = ?,
+          updated_at = DATETIME('now', 'localtime')
+      WHERE id = ?
+    `,
+    [
+      values.fulfillmentMode || FULFILLMENT_MODE_EXTERNAL,
+      values.supplierName || null,
+      values.supplierType || null,
+      values.supplierRequestId || null,
+      values.supplierStatus || SUPPLIER_STATUS_PENDING,
+      values.supplierResponseCode || null,
+      values.supplierResponseMessage || null,
+      truncateSupplierPayload(values.supplierResponseRaw),
+      codeId,
+    ]
+  )
+}
+
+const resolveSupplierStatusFromCheckResult = (codeRecord, providerResult) => {
+  const checkStatus = String(providerResult?.status || '').trim().toLowerCase()
+  if (checkStatus === 'available') {
+    return codeRecord?.isRedeemed ? SUPPLIER_STATUS_SUCCESS : SUPPLIER_STATUS_PENDING
+  }
+  if (checkStatus === SUPPLIER_STATUS_USED) {
+    return codeRecord?.isRedeemed ? SUPPLIER_STATUS_SUCCESS : SUPPLIER_STATUS_USED
+  }
+  if (checkStatus === SUPPLIER_STATUS_INVALID) {
+    return SUPPLIER_STATUS_INVALID
+  }
+  return SUPPLIER_STATUS_FAILED
+}
+
 async function redeemExternalSupplierCode({
   db,
   codeRecord,
@@ -441,6 +490,12 @@ async function redeemExternalSupplierCode({
   if (existingStatus === SUPPLIER_STATUS_INVALID) {
     throw new RedemptionError(400, '该卡密已失效，请联系管理员', {
       status: SUPPLIER_STATUS_INVALID,
+      fulfillmentMode: FULFILLMENT_MODE_EXTERNAL
+    })
+  }
+  if (existingStatus === SUPPLIER_STATUS_USED) {
+    throw new RedemptionError(400, '该卡密已被上游使用，请联系管理员', {
+      status: SUPPLIER_STATUS_USED,
       fulfillmentMode: FULFILLMENT_MODE_EXTERNAL
     })
   }
@@ -547,6 +602,8 @@ export async function redeemCodeInternal({
   skipCodeFormatValidation = false,
   allowCommonChannelFallback = false,
   allowNonOpenAccount = false,
+  allowDownstreamSoldRedeem = false,
+  skipReservedOrderValidation = false,
 }) {
   const normalizedEmail = (email || '').trim()
   if (!normalizedEmail) {
@@ -592,7 +649,7 @@ export async function redeemCodeInternal({
       SELECT id, code, is_redeemed, redeemed_at, redeemed_by,
              account_email, channel, channel_name, created_at, updated_at,
              reserved_for_uid, reserved_for_username, reserved_for_entry_id, reserved_at,
-             reserved_for_order_no, reserved_for_order_email, order_type,
+             reserved_for_order_no, reserved_for_order_email, order_type, is_downstream_sold, downstream_sold_at,
              fulfillment_mode, supplier_name, supplier_type, supplier_request_id,
              supplier_status, supplier_response_code, supplier_response_message, supplier_redeemed_at
       FROM redemption_codes
@@ -607,6 +664,7 @@ export async function redeemCodeInternal({
   const codeRecord = mapCodeRow(codeRow, channelsByKey)
   const codeId = codeRecord.id
   const isRedeemed = codeRecord.isRedeemed
+  const isDownstreamSold = Boolean(codeRecord.isDownstreamSold)
   const boundAccountEmail = codeRecord.accountEmail
   const codeChannel = codeRecord.channel
   const storedChannel = codeRow[6] == null ? '' : String(codeRow[6]).trim().toLowerCase()
@@ -624,6 +682,13 @@ export async function redeemCodeInternal({
     throw new RedemptionError(400, '该兑换码已被使用')
   }
 
+  if (isDownstreamSold && !allowDownstreamSoldRedeem) {
+    throw new RedemptionError(403, DOWNSTREAM_SOLD_MESSAGE, {
+      status: 'downstream_sold',
+      downstreamSoldAt: codeRecord.downstreamSoldAt || null
+    })
+  }
+
   const fallbackFromCommonChannelAllowed = Boolean(allowCommonChannelFallback)
     && isStoredCommonChannel
     && requestedChannel !== 'common'
@@ -637,7 +702,7 @@ export async function redeemCodeInternal({
     throw new RedemptionError(403, '该兑换码已绑定其他 Linux DO 用户')
   }
 
-  if (reservedForOrderNo) {
+  if (reservedForOrderNo && !skipReservedOrderValidation) {
     const orderResult = db.exec(
       `
         SELECT status, email, refunded_at, order_type
@@ -1008,7 +1073,7 @@ router.get('/', authenticateToken, requireMenu('redemption_codes'), async (req, 
         SELECT rc.id, rc.code, rc.is_redeemed, rc.redeemed_at, rc.redeemed_by,
                rc.account_email, rc.channel, rc.channel_name, rc.created_at, rc.updated_at,
                rc.reserved_for_uid, rc.reserved_for_username, rc.reserved_for_entry_id, rc.reserved_at,
-               rc.reserved_for_order_no, rc.reserved_for_order_email, rc.order_type,
+               rc.reserved_for_order_no, rc.reserved_for_order_email, rc.order_type, rc.is_downstream_sold, rc.downstream_sold_at,
                CASE
                  WHEN ga.id IS NULL THEN 0
                  ELSE COALESCE(ga.is_banned, 0)
@@ -1039,8 +1104,11 @@ router.get('/', authenticateToken, requireMenu('redemption_codes'), async (req, 
 
     if (status === 'redeemed') {
       conditions.push('rc.is_redeemed = 1')
+    } else if (status === 'downstream_sold') {
+      conditions.push('COALESCE(rc.is_downstream_sold, 0) = 1')
     } else if (status === 'unused' || status === 'unredeemed') {
       conditions.push('rc.is_redeemed = 0')
+      conditions.push('COALESCE(rc.is_downstream_sold, 0) = 0')
     }
 
     if (search) {
@@ -1080,7 +1148,7 @@ router.get('/', authenticateToken, requireMenu('redemption_codes'), async (req, 
         SELECT rc.id, rc.code, rc.is_redeemed, rc.redeemed_at, rc.redeemed_by,
                rc.account_email, rc.channel, rc.channel_name, rc.created_at, rc.updated_at,
                rc.reserved_for_uid, rc.reserved_for_username, rc.reserved_for_entry_id, rc.reserved_at,
-               rc.reserved_for_order_no, rc.reserved_for_order_email, rc.order_type,
+               rc.reserved_for_order_no, rc.reserved_for_order_email, rc.order_type, rc.is_downstream_sold, rc.downstream_sold_at,
                CASE
                  WHEN ga.id IS NULL THEN 0
                  ELSE COALESCE(ga.is_banned, 0)
@@ -1205,6 +1273,128 @@ router.post('/:id/reinvite', authenticateToken, requireMenu('redemption_codes'),
   }
 })
 
+router.post('/:id/upstream-check', authenticateToken, requireMenu('redemption_codes'), async (req, res) => {
+  try {
+    const codeId = toInt(req.params.id, 0)
+    if (!codeId) {
+      return res.status(400).json({ error: '无效的兑换码 ID' })
+    }
+
+    const db = await getDatabase()
+    const existingCodeResult = db.exec(
+      `
+        SELECT code
+        FROM redemption_codes
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [codeId]
+    )
+    const lockedCodeValue = existingCodeResult[0]?.values?.[0]?.[0]
+    if (!lockedCodeValue) {
+      return res.status(404).json({ error: '兑换码不存在' })
+    }
+
+    return await withLocks([`redemption-code:${lockedCodeValue}`, `redemption-code:check:${codeId}`], async () => {
+      const { byKey: channelsByKey } = await getChannels(db)
+      const result = db.exec(
+        `
+          SELECT id, code, is_redeemed, redeemed_at, redeemed_by,
+                 account_email, channel, channel_name, created_at, updated_at,
+                 reserved_for_uid, reserved_for_username, reserved_for_entry_id, reserved_at,
+                 reserved_for_order_no, reserved_for_order_email, order_type, is_downstream_sold, downstream_sold_at,
+                 fulfillment_mode, supplier_name, supplier_type, supplier_request_id,
+                 supplier_status, supplier_response_code, supplier_response_message, supplier_redeemed_at
+          FROM redemption_codes
+          WHERE id = ?
+          LIMIT 1
+        `,
+        [codeId]
+      )
+
+      if (result.length === 0 || result[0].values.length === 0) {
+        return res.status(404).json({ error: '兑换码不存在' })
+      }
+
+      const codeRecord = mapCodeRow(result[0].values[0], channelsByKey)
+      const requestedChannel = normalizeChannel(codeRecord?.channel, 'common')
+      const channelConfig = channelsByKey.get(requestedChannel) || null
+      if (!channelConfig) {
+        return res.status(400).json({ error: '兑换码渠道配置不存在，请先检查渠道设置' })
+      }
+      if (!isExternalCardRedeemMode(channelConfig)) {
+        return res.status(400).json({ error: '当前兑换码不是卡密兑换渠道，无法执行上游检查' })
+      }
+      if (String(channelConfig.providerType || '').trim().toLowerCase() !== 'platform-upstream') {
+        return res.status(400).json({ error: '当前渠道的出站履约类型不是平台通用接口，无法执行上游检查' })
+      }
+      if (codeRecord?.isDownstreamSold) {
+        return res.status(400).json({ error: DOWNSTREAM_SOLD_MESSAGE })
+      }
+
+      const providerResult = await checkViaUpstreamProvider(
+        {
+          code: codeRecord.code,
+          channel: requestedChannel
+        },
+        {
+          providerType: channelConfig.providerType
+        }
+      )
+
+      updateExternalSupplierCheckResult(db, codeRecord.id, {
+        fulfillmentMode: FULFILLMENT_MODE_EXTERNAL,
+        supplierName: providerResult.supplierName,
+        supplierType: providerResult.providerType,
+        supplierRequestId: providerResult.requestId,
+        supplierStatus: resolveSupplierStatusFromCheckResult(codeRecord, providerResult),
+        supplierResponseCode: providerResult.responseCode,
+        supplierResponseMessage: providerResult.message,
+        supplierResponseRaw: providerResult.responseRaw,
+      })
+      saveDatabase()
+
+      const updatedResult = db.exec(
+        `
+          SELECT id, code, is_redeemed, redeemed_at, redeemed_by,
+                 account_email, channel, channel_name, created_at, updated_at,
+                 reserved_for_uid, reserved_for_username, reserved_for_entry_id, reserved_at,
+                 reserved_for_order_no, reserved_for_order_email, order_type, is_downstream_sold, downstream_sold_at,
+                 fulfillment_mode, supplier_name, supplier_type, supplier_request_id,
+                 supplier_status, supplier_response_code, supplier_response_message, supplier_redeemed_at
+          FROM redemption_codes
+          WHERE id = ?
+          LIMIT 1
+        `,
+        [codeId]
+      )
+
+      const updatedCode = updatedResult.length > 0 && updatedResult[0].values.length > 0
+        ? mapCodeRow(updatedResult[0].values[0], channelsByKey)
+        : null
+
+      return res.json({
+        message: providerResult.message || '上游检查完成',
+        result: {
+          ok: providerResult.ok,
+          status: providerResult.status,
+          retryable: Boolean(providerResult.retryable),
+          providerType: providerResult.providerType,
+          supplierName: providerResult.supplierName,
+          supplierRequestId: providerResult.requestId,
+          responseCode: providerResult.responseCode,
+          message: providerResult.message,
+          data: providerResult.data || null
+        },
+        code: updatedCode
+      })
+    })
+  } catch (error) {
+    console.error('执行上游检查失败:', error)
+    res.status(500).json({ error: '内部服务器错误' })
+  }
+})
+
 // 批量创建兑换码
 router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async (req, res) => {
   try {
@@ -1322,7 +1512,7 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
       SELECT id, code, is_redeemed, redeemed_at, redeemed_by,
              account_email, channel, channel_name, created_at, updated_at,
              reserved_for_uid, reserved_for_username, reserved_for_entry_id, reserved_at,
-             reserved_for_order_no, reserved_for_order_email, order_type,
+             reserved_for_order_no, reserved_for_order_email, order_type, is_downstream_sold, downstream_sold_at,
              fulfillment_mode, supplier_name, supplier_type, supplier_request_id,
              supplier_status, supplier_response_code, supplier_response_message, supplier_redeemed_at
       FROM redemption_codes
@@ -1423,7 +1613,7 @@ router.post('/import-external', authenticateToken, requireMenu('redemption_codes
             SELECT id, code, is_redeemed, redeemed_at, redeemed_by,
                    account_email, channel, channel_name, created_at, updated_at,
                    reserved_for_uid, reserved_for_username, reserved_for_entry_id, reserved_at,
-                   reserved_for_order_no, reserved_for_order_email, order_type,
+                   reserved_for_order_no, reserved_for_order_email, order_type, is_downstream_sold, downstream_sold_at,
                    fulfillment_mode, supplier_name, supplier_type, supplier_request_id,
                    supplier_status, supplier_response_code, supplier_response_message, supplier_redeemed_at
             FROM redemption_codes
@@ -1502,7 +1692,7 @@ router.patch('/:id/channel', authenticateToken, requireMenu('redemption_codes'),
       SELECT id, code, is_redeemed, redeemed_at, redeemed_by,
              account_email, channel, channel_name, created_at, updated_at,
              reserved_for_uid, reserved_for_username, reserved_for_entry_id, reserved_at,
-             reserved_for_order_no, reserved_for_order_email, order_type,
+             reserved_for_order_no, reserved_for_order_email, order_type, is_downstream_sold, downstream_sold_at,
              fulfillment_mode, supplier_name, supplier_type, supplier_request_id,
              supplier_status, supplier_response_code, supplier_response_message, supplier_redeemed_at
       FROM redemption_codes
@@ -1551,7 +1741,7 @@ router.post('/admin/redeem', authenticateToken, requireMenu('redemption_codes'),
     const { code, email, channel, redeemerUid, orderType, order_type: orderTypeLegacy } = req.body || {}
     const lockKey = String(code || '').trim()
     const result = await withLocks(
-      lockKey ? [`redemption-code:${lockKey}`] : [],
+      lockKey ? ['purchase', `redemption-code:${lockKey}`] : ['purchase'],
       () => redeemCodeInternal({
         code,
         email,
@@ -1598,7 +1788,7 @@ router.post('/redeem', async (req, res) => {
 
     const lockKey = String(code || '').trim()
     const result = await withLocks(
-      lockKey ? [`redemption-code:${lockKey}`] : [],
+      lockKey ? ['purchase', `redemption-code:${lockKey}`] : ['purchase'],
       () => redeemCodeInternal({
         code,
         email,
@@ -2046,12 +2236,14 @@ router.post('/recover', async (req, res) => {
           const recoveryAccountEmail = selectedRecovery.recoveryAccountEmail
 
           try {
-            const redemptionResult = await redeemCodeInternal({
-              code: recoveryCode,
-              email: normalizedEmail,
-              channel: recoveryChannel || 'common',
-              skipCodeFormatValidation
-            })
+            const redemptionResult = await withLocks(['purchase', `redemption-code:${recoveryCode}`], () => (
+              redeemCodeInternal({
+                code: recoveryCode,
+                email: normalizedEmail,
+                channel: recoveryChannel || 'common',
+                skipCodeFormatValidation
+              })
+            ))
 
             recordAccountRecovery(db, {
               email: normalizedEmail,
@@ -2252,7 +2444,7 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
       return res.status(400).json({ error: '请输入有效的小红书订单号' })
     }
 
-    await withLocks([`xhs-redeem`, `xhs-order:${normalizedOrderNumber}`], async () => {
+    await withLocks(['purchase', `xhs-redeem`, `xhs-order:${normalizedOrderNumber}`], async () => {
 	      const orderRecord = await getXhsOrderByNumber(normalizedOrderNumber)
 	      if (!orderRecord) {
 	        return res.status(404).json({ error: '未找到对应订单，请稍后再试' })
@@ -2279,6 +2471,7 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
 		          FROM redemption_codes rc
 		          WHERE lower(trim(rc.channel)) = 'xhs'
 		            AND rc.is_redeemed = 0
+                AND COALESCE(rc.is_downstream_sold, 0) = 0
 		            AND DATE(rc.created_at) = DATE('now', 'localtime')
                 AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                 AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
@@ -2308,6 +2501,7 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
                   ON lower(trim(ga.email)) = lower(trim(rc.account_email))
 		            WHERE lower(trim(rc.channel)) = 'xhs'
 		              AND rc.is_redeemed = 0
+                  AND COALESCE(rc.is_downstream_sold, 0) = 0
 		              AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
                   AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                   AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
@@ -2332,6 +2526,7 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
               ON lower(trim(ga.email)) = lower(trim(rc.account_email))
             WHERE lower(trim(rc.channel)) = 'xhs'
               AND rc.is_redeemed = 0
+              AND COALESCE(rc.is_downstream_sold, 0) = 0
               AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
               AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
               AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
@@ -2354,6 +2549,7 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
                 FROM redemption_codes rc
                 WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
                   AND rc.is_redeemed = 0
+                  AND COALESCE(rc.is_downstream_sold, 0) = 0
                   AND DATE(rc.created_at) = DATE('now', 'localtime')
                   AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                   AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
@@ -2382,6 +2578,7 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
                     ON lower(trim(ga.email)) = lower(trim(rc.account_email))
                   WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
                     AND rc.is_redeemed = 0
+                    AND COALESCE(rc.is_downstream_sold, 0) = 0
                     AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
                     AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                     AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
@@ -2406,6 +2603,7 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
                     ON lower(trim(ga.email)) = lower(trim(rc.account_email))
                   WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
                     AND rc.is_redeemed = 0
+                    AND COALESCE(rc.is_downstream_sold, 0) = 0
                     AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                     AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
                     AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
@@ -2425,13 +2623,15 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
             const selectedCodeId = commonCodeRow[0]
             const selectedCode = commonCodeRow[1]
 
-            const redemptionResult = await redeemCodeInternal({
-              code: selectedCode,
-              email: normalizedEmail,
-              channel: 'xhs',
-              skipCodeFormatValidation: true,
-              allowCommonChannelFallback: true
-            })
+            const redemptionResult = await withLocks([`redemption-code:${selectedCode}`], () => (
+              redeemCodeInternal({
+                code: selectedCode,
+                email: normalizedEmail,
+                channel: 'xhs',
+                skipCodeFormatValidation: true,
+                allowCommonChannelFallback: true
+              })
+            ))
 
             await markXhsOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
 
@@ -2459,11 +2659,12 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
 	          `
 	            SELECT
 	              COUNT(*) as all_total,
-	              SUM(CASE WHEN is_redeemed = 0 THEN 1 ELSE 0 END) as all_unused,
+	              SUM(CASE WHEN is_redeemed = 0 AND COALESCE(is_downstream_sold, 0) = 0 THEN 1 ELSE 0 END) as all_unused,
 	              SUM(CASE WHEN DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_total,
-	              SUM(CASE WHEN is_redeemed = 0 AND DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_unused
+	              SUM(CASE WHEN is_redeemed = 0 AND COALESCE(is_downstream_sold, 0) = 0 AND DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_unused
 	            FROM redemption_codes rc
 	            WHERE lower(trim(rc.channel)) = 'xhs'
+	              AND COALESCE(rc.is_downstream_sold, 0) = 0
 	              AND (
 	                rc.account_email IS NULL
                   OR trim(rc.account_email) = ''
@@ -2490,13 +2691,15 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
       const selectedCodeId = selectedCodeRow[0]
       const selectedCode = selectedCodeRow[1]
 
-      const redemptionResult = await redeemCodeInternal({
-        code: selectedCode,
-        email: normalizedEmail,
-        channel: 'xhs',
-        skipCodeFormatValidation: true,
-        allowCommonChannelFallback: true
-      })
+      const redemptionResult = await withLocks([`redemption-code:${selectedCode}`], () => (
+        redeemCodeInternal({
+          code: selectedCode,
+          email: normalizedEmail,
+          channel: 'xhs',
+          skipCodeFormatValidation: true,
+          allowCommonChannelFallback: true
+        })
+      ))
 
       await markXhsOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
 
@@ -2627,7 +2830,7 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
       return res.status(400).json({ error: '请输入有效的闲鱼订单号' })
     }
 
-    await withLocks([`xianyu-redeem`, `xianyu-order:${normalizedOrderId}`], async () => {
+    await withLocks(['purchase', `xianyu-redeem`, `xianyu-order:${normalizedOrderId}`], async () => {
       const orderRecord = await getXianyuOrderById(normalizedOrderId)
       if (!orderRecord) {
         return res.status(404).json({ error: '未找到对应订单，请稍后再试' })
@@ -2655,6 +2858,7 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
 	          FROM redemption_codes rc
 	          WHERE lower(trim(rc.channel)) = 'xianyu'
 	            AND rc.is_redeemed = 0
+              AND COALESCE(rc.is_downstream_sold, 0) = 0
 	            AND DATE(rc.created_at) = DATE('now', 'localtime')
               AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
               AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
@@ -2684,6 +2888,7 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
                 ON lower(trim(ga.email)) = lower(trim(rc.account_email))
 	            WHERE lower(trim(rc.channel)) = 'xianyu'
 	              AND rc.is_redeemed = 0
+                AND COALESCE(rc.is_downstream_sold, 0) = 0
 	              AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
                 AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                 AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
@@ -2708,6 +2913,7 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
               ON lower(trim(ga.email)) = lower(trim(rc.account_email))
             WHERE lower(trim(rc.channel)) = 'xianyu'
               AND rc.is_redeemed = 0
+              AND COALESCE(rc.is_downstream_sold, 0) = 0
               AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
               AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
               AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
@@ -2730,6 +2936,7 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
                 FROM redemption_codes rc
                 WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
                   AND rc.is_redeemed = 0
+                  AND COALESCE(rc.is_downstream_sold, 0) = 0
                   AND DATE(rc.created_at) = DATE('now', 'localtime')
                   AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                   AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
@@ -2758,6 +2965,7 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
                     ON lower(trim(ga.email)) = lower(trim(rc.account_email))
                   WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
                     AND rc.is_redeemed = 0
+                    AND COALESCE(rc.is_downstream_sold, 0) = 0
                     AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
                     AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                     AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
@@ -2782,6 +2990,7 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
                     ON lower(trim(ga.email)) = lower(trim(rc.account_email))
                   WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
                     AND rc.is_redeemed = 0
+                    AND COALESCE(rc.is_downstream_sold, 0) = 0
                     AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                     AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
                     AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
@@ -2801,14 +3010,16 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
             const selectedCodeId = commonCodeRow[0]
             const selectedCode = commonCodeRow[1]
 
-            const redemptionResult = await redeemCodeInternal({
-              code: selectedCode,
-              email: normalizedEmail,
-              channel: 'xianyu',
-              orderType: resolvedOrderType,
-              skipCodeFormatValidation: true,
-              allowCommonChannelFallback: true
-            })
+            const redemptionResult = await withLocks([`redemption-code:${selectedCode}`], () => (
+              redeemCodeInternal({
+                code: selectedCode,
+                email: normalizedEmail,
+                channel: 'xianyu',
+                orderType: resolvedOrderType,
+                skipCodeFormatValidation: true,
+                allowCommonChannelFallback: true
+              })
+            ))
 
             await markXianyuOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
 
@@ -2834,13 +3045,14 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
 	      if (!selectedCodeRow) {
 	        const statsResult = db.exec(
 	          `
-	            SELECT
+            SELECT
               COUNT(*) as all_total,
-              SUM(CASE WHEN is_redeemed = 0 THEN 1 ELSE 0 END) as all_unused,
+              SUM(CASE WHEN is_redeemed = 0 AND COALESCE(is_downstream_sold, 0) = 0 THEN 1 ELSE 0 END) as all_unused,
               SUM(CASE WHEN DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_total,
-              SUM(CASE WHEN is_redeemed = 0 AND DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_unused
+              SUM(CASE WHEN is_redeemed = 0 AND COALESCE(is_downstream_sold, 0) = 0 AND DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_unused
             FROM redemption_codes rc
             WHERE lower(trim(rc.channel)) = 'xianyu'
+              AND COALESCE(rc.is_downstream_sold, 0) = 0
               AND (
                 rc.account_email IS NULL
                 OR trim(rc.account_email) = ''
@@ -2867,14 +3079,16 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
       const selectedCodeId = selectedCodeRow[0]
       const selectedCode = selectedCodeRow[1]
 
-	      const redemptionResult = await redeemCodeInternal({
-	        code: selectedCode,
-	        email: normalizedEmail,
-	        channel: 'xianyu',
-	        orderType: resolvedOrderType,
-	        skipCodeFormatValidation: true,
-          allowCommonChannelFallback: true
-	      })
+	      const redemptionResult = await withLocks([`redemption-code:${selectedCode}`], () => (
+	        redeemCodeInternal({
+	          code: selectedCode,
+	          email: normalizedEmail,
+	          channel: 'xianyu',
+	          orderType: resolvedOrderType,
+	          skipCodeFormatValidation: true,
+            allowCommonChannelFallback: true
+	        })
+	      ))
 
       await markXianyuOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
 

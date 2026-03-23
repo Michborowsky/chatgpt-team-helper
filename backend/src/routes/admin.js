@@ -1,4 +1,6 @@
+import crypto from 'crypto'
 import express from 'express'
+import axios from 'axios'
 import { getDatabase, saveDatabase } from '../database/init.js'
 import { authenticateToken } from '../middleware/auth.js'
 import { requireSuperAdmin } from '../middleware/rbac.js'
@@ -18,8 +20,26 @@ import {
 import { getZpaySettings, getZpaySettingsFromEnv, invalidateZpaySettingsCache } from '../utils/zpay-settings.js'
 import { getTurnstileSettings, getTurnstileSettingsFromEnv, invalidateTurnstileSettingsCache } from '../utils/turnstile-settings.js'
 import { getTelegramSettings, getTelegramSettingsFromEnv, invalidateTelegramSettingsCache } from '../utils/telegram-settings.js'
-import { getUpstreamSettings, getUpstreamSettingsFromEnv, invalidateUpstreamSettingsCache } from '../utils/upstream-settings.js'
+import {
+  getUpstreamSettings,
+  getUpstreamSettingsFromEnv,
+  invalidateUpstreamSettingsCache,
+  normalizeUpstreamPeerDomain,
+  stringifyUpstreamInboundClients,
+} from '../utils/upstream-settings.js'
+import { getPublicBaseUrlSettings, invalidatePublicBaseUrlCache, normalizePublicBaseUrl } from '../utils/public-base-url.js'
+import { getDownstreamSaleSettings, invalidateDownstreamSaleSettingsCache } from '../utils/downstream-sale-settings.js'
 import { getFeatureFlags, invalidateFeatureFlagsCache } from '../utils/feature-flags.js'
+import {
+  GLOBAL_PROXY_URLS_CONFIG_KEY,
+  buildAxiosProxyOptions,
+  formatProxyForLog,
+  getGlobalProxySettings,
+  inspectProxyListInput,
+  invalidateGlobalProxySettingsCache,
+  loadGlobalProxyList,
+  stringifyProxyUrlEntries,
+} from '../utils/proxy.js'
 import { CHANNEL_KEY_REGEX, getChannelByKey, getChannels, invalidateChannelsCache, normalizeChannelKey } from '../utils/channels.js'
 import { getAccountRecoverySettings, invalidateAccountRecoverySettingsCache } from '../utils/account-recovery-settings.js'
 import {
@@ -35,6 +55,7 @@ import {
 import { withLocks } from '../utils/locks.js'
 import { redeemCodeInternal } from './redemption-codes.js'
 import { resolveOrderDeadlineMs, selectRecoveryCode } from '../services/account-recovery.js'
+import { CHATGPT_OAI_CLIENT_VERSION } from '../services/account-client-profile.js'
 
 const router = express.Router()
 
@@ -163,6 +184,106 @@ const parseBoolean = (value, fallback) => {
   return fallback
 }
 
+const CHATGPT_PROXY_TEST_URL = 'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27'
+const CHATGPT_PROXY_TEST_TIMEOUT_MS = 15000
+const CHATGPT_PROXY_TEST_CONCURRENCY = 3
+
+const buildProxySettingsResponse = (settings) => ({
+  proxy: {
+    proxyUrls: String(settings?.proxyUrls || ''),
+    stored: Boolean(settings?.stored),
+    effectiveCount: Number(settings?.effectiveCount || 0) || 0,
+  }
+})
+
+const getProxyTestMessage = (status) => {
+  const code = Number(status)
+  if (code >= 200 && code < 400) return `代理可达，chatgpt.com 返回 HTTP ${code}`
+  if (code === 401) return '代理可达，链路正常'
+  if (code === 403) return '代理已连通，但 chatgpt.com 返回 403，可能被风控或 Cloudflare 拦截'
+  if (code === 429) return '代理已连通，但 chatgpt.com 返回 429，可能触发频率限制'
+  if (code >= 500 && code <= 599) return `代理已连通，但 chatgpt.com 返回 HTTP ${code}`
+  return `代理已连通，但返回了非预期状态 HTTP ${code}`
+}
+
+const toBodySnippet = (value, maxLength = 300) => {
+  if (value == null) return ''
+  const text = typeof value === 'string' ? value : JSON.stringify(value)
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxLength)
+}
+
+const mapWithConcurrency = async (items, concurrency, fn) => {
+  const list = Array.isArray(items) ? items : []
+  const limit = Math.max(1, Number(concurrency) || 1)
+  if (!list.length) return []
+
+  const results = new Array(list.length)
+  let cursor = 0
+
+  const workers = Array.from({ length: Math.min(limit, list.length) }).map(async () => {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const index = cursor++
+      if (index >= list.length) break
+      results[index] = await fn(list[index], index)
+    }
+  })
+
+  await Promise.all(workers)
+  return results
+}
+
+const probeChatgptProxy = async (proxyEntry) => {
+  const startedAt = Date.now()
+  const proxyUrl = String(proxyEntry?.url || '').trim()
+  const proxyLabel = formatProxyForLog(proxyUrl)
+
+  try {
+    const axiosProxyOptions = await buildAxiosProxyOptions(proxyUrl)
+    const response = await axios.request({
+      url: CHATGPT_PROXY_TEST_URL,
+      method: 'GET',
+      timeout: CHATGPT_PROXY_TEST_TIMEOUT_MS,
+      ...axiosProxyOptions,
+      responseType: 'text',
+      transformResponse: [data => data],
+      validateStatus: () => true,
+      headers: {
+        accept: '*/*',
+        'accept-language': 'zh-CN,zh;q=0.9',
+        'oai-client-version': CHATGPT_OAI_CLIENT_VERSION,
+        'oai-language': 'zh-CN',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+      },
+    })
+
+    const status = Number(response.status || 0)
+    const reachable = status > 0
+    const ok = (status >= 200 && status < 400) || status === 401
+    const bodySnippet = ok ? '' : toBodySnippet(response.data)
+
+    return {
+      proxy: proxyLabel || proxyUrl,
+      ok,
+      reachable,
+      status,
+      durationMs: Date.now() - startedAt,
+      message: getProxyTestMessage(status),
+      ...(bodySnippet ? { bodySnippet } : {}),
+    }
+  } catch (error) {
+    return {
+      proxy: proxyLabel || proxyUrl,
+      ok: false,
+      reachable: false,
+      status: 0,
+      durationMs: Date.now() - startedAt,
+      message: error?.message || '代理连接失败',
+      ...(error?.code ? { bodySnippet: String(error.code) } : {}),
+    }
+  }
+}
+
 const DEFAULT_UPSTREAM_CUSTOM_BODY_TEMPLATE = JSON.stringify({
   userEmail: '{{email}}',
   cardCode: '{{code}}'
@@ -192,6 +313,43 @@ const validateUpstreamJsonTemplate = (template) => {
       error: '自定义接口 Body JSON 格式不正确，或占位符位置不合法'
     }
   }
+}
+
+const LEGACY_UPSTREAM_INBOUND_CLIENT_ID = 'legacy-default'
+
+const buildUpstreamInboundClientResponse = (client, { stored = false, legacy = false } = {}) => ({
+  id: String(client?.id || ''),
+  domain: String(client?.domain || ''),
+  apiKeySet: Boolean(String(client?.apiKey || '').trim()),
+  apiKeyStored: Boolean(stored && String(client?.apiKey || '').trim()),
+  legacy: Boolean(legacy),
+})
+
+const buildUpstreamInboundClientsResponse = (settings) => {
+  const clients = Array.isArray(settings?.inboundClients)
+    ? settings.inboundClients.filter(client => Boolean(String(client?.apiKey || '').trim()))
+    : []
+
+  if (clients.length > 0) {
+    return clients.map(client => buildUpstreamInboundClientResponse(client, {
+      stored: Boolean(settings?.stored?.inboundClients),
+    }))
+  }
+
+  if (String(settings?.apiKey || '').trim()) {
+    return [
+      buildUpstreamInboundClientResponse({
+        id: LEGACY_UPSTREAM_INBOUND_CLIENT_ID,
+        domain: '',
+        apiKey: settings.apiKey,
+      }, {
+        stored: Boolean(settings?.stored?.apiKey),
+        legacy: true,
+      })
+    ]
+  }
+
+  return []
 }
 
 const normalizeMoney2 = (value) => {
@@ -908,6 +1066,86 @@ router.put('/zpay-settings', async (req, res) => {
   }
 })
 
+router.get('/downstream-sale-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = await getDownstreamSaleSettings(db, { forceRefresh: true })
+
+    res.json({
+      downstreamSale: {
+        enabled: Boolean(settings.enabled),
+        enabledStored: Boolean(settings.stored?.enabled),
+        productName: String(settings.productName || ''),
+        productNameStored: Boolean(settings.stored?.productName),
+        amount: String(settings.amount || ''),
+        amountStored: Boolean(settings.stored?.amount),
+        payAlipayEnabled: Boolean(settings.payAlipayEnabled),
+        payAlipayEnabledStored: Boolean(settings.stored?.payAlipayEnabled),
+        payWxpayEnabled: Boolean(settings.payWxpayEnabled),
+        payWxpayEnabledStored: Boolean(settings.stored?.payWxpayEnabled)
+      }
+    })
+  } catch (error) {
+    console.error('Get downstream-sale-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/downstream-sale-settings', async (req, res) => {
+  try {
+    const payload = req.body?.downstreamSale && typeof req.body.downstreamSale === 'object' ? req.body.downstreamSale : (req.body || {})
+    const db = await getDatabase()
+
+    const current = await getDownstreamSaleSettings(db, { forceRefresh: true })
+
+    const enabled = parseBool(payload.enabled, Boolean(current.enabled))
+    const productName = String(payload.productName ?? current.productName ?? '').trim()
+    const rawAmount = String(payload.amount ?? current.amount ?? '').trim()
+    const amountNumber = Number.parseFloat(rawAmount)
+    const payAlipayEnabled = parseBool(payload.payAlipayEnabled, Boolean(current.payAlipayEnabled))
+    const payWxpayEnabled = parseBool(payload.payWxpayEnabled, Boolean(current.payWxpayEnabled))
+
+    if (!productName) {
+      return res.status(400).json({ error: '下游商品名称不能为空' })
+    }
+    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+      return res.status(400).json({ error: '下游售价必须为大于 0 的数字' })
+    }
+    if (!payAlipayEnabled && !payWxpayEnabled) {
+      return res.status(400).json({ error: '支付宝和微信至少启用一个' })
+    }
+    const amount = (Math.round(amountNumber * 100) / 100).toFixed(2)
+
+    upsertSystemConfigValue(db, 'downstream_sale_enabled', enabled ? 'true' : 'false')
+    upsertSystemConfigValue(db, 'downstream_sale_product_name', productName)
+    upsertSystemConfigValue(db, 'downstream_sale_amount', amount)
+    upsertSystemConfigValue(db, 'downstream_sale_pay_alipay_enabled', payAlipayEnabled ? 'true' : 'false')
+    upsertSystemConfigValue(db, 'downstream_sale_pay_wxpay_enabled', payWxpayEnabled ? 'true' : 'false')
+
+    saveDatabase()
+    invalidateDownstreamSaleSettingsCache()
+
+    const updated = await getDownstreamSaleSettings(db, { forceRefresh: true })
+    res.json({
+      downstreamSale: {
+        enabled: Boolean(updated.enabled),
+        enabledStored: Boolean(updated.stored?.enabled),
+        productName: String(updated.productName || ''),
+        productNameStored: Boolean(updated.stored?.productName),
+        amount: String(updated.amount || ''),
+        amountStored: Boolean(updated.stored?.amount),
+        payAlipayEnabled: Boolean(updated.payAlipayEnabled),
+        payAlipayEnabledStored: Boolean(updated.stored?.payAlipayEnabled),
+        payWxpayEnabled: Boolean(updated.payWxpayEnabled),
+        payWxpayEnabledStored: Boolean(updated.stored?.payWxpayEnabled)
+      }
+    })
+  } catch (error) {
+    console.error('Update downstream-sale-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 router.get('/turnstile-settings', async (req, res) => {
   try {
     const db = await getDatabase()
@@ -1097,10 +1335,93 @@ router.put('/telegram-settings', async (req, res) => {
   }
 })
 
+router.get('/proxy-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = await getGlobalProxySettings(db, { forceRefresh: true })
+    res.json(buildProxySettingsResponse(settings))
+  } catch (error) {
+    console.error('Get proxy-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/proxy-settings', async (req, res) => {
+  try {
+    const payload = req.body?.proxy && typeof req.body.proxy === 'object' ? req.body.proxy : (req.body || {})
+    const proxyUrlsInput = payload.proxyUrls ?? payload.proxy_urls ?? ''
+    const { entries, invalidEntries } = inspectProxyListInput(proxyUrlsInput)
+
+    if (invalidEntries.length > 0) {
+      return res.status(400).json({
+        error: `代理地址格式不正确：${formatProxyForLog(invalidEntries[0]) || invalidEntries[0]}`
+      })
+    }
+
+    const db = await getDatabase()
+    if (entries.length > 0) {
+      upsertSystemConfigValue(db, GLOBAL_PROXY_URLS_CONFIG_KEY, stringifyProxyUrlEntries(entries))
+    } else {
+      db.run('DELETE FROM system_config WHERE config_key = ?', [GLOBAL_PROXY_URLS_CONFIG_KEY])
+    }
+
+    saveDatabase()
+    invalidateGlobalProxySettingsCache()
+
+    const settings = await getGlobalProxySettings(db, { forceRefresh: true })
+    res.json(buildProxySettingsResponse(settings))
+  } catch (error) {
+    console.error('Update proxy-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.post('/proxy-settings/test', async (req, res) => {
+  try {
+    const payload = req.body?.proxy && typeof req.body.proxy === 'object' ? req.body.proxy : (req.body || {})
+    const hasInput = payload.proxyUrls !== undefined || payload.proxy_urls !== undefined
+    const proxyUrlsInput = payload.proxyUrls ?? payload.proxy_urls ?? ''
+    const db = await getDatabase()
+
+    let proxies = []
+    if (hasInput) {
+      const { proxies: inspectedProxies, invalidEntries } = inspectProxyListInput(proxyUrlsInput)
+      if (invalidEntries.length > 0) {
+        return res.status(400).json({
+          error: `代理地址格式不正确：${formatProxyForLog(invalidEntries[0]) || invalidEntries[0]}`
+        })
+      }
+      proxies = inspectedProxies
+    } else {
+      proxies = await loadGlobalProxyList(db, { forceRefresh: true })
+    }
+
+    if (proxies.length === 0) {
+      return res.status(400).json({ error: '当前未配置可用代理，请先保存 OPEN_ACCOUNTS_SWEEPER_PROXY_URLS' })
+    }
+
+    const results = await mapWithConcurrency(proxies, CHATGPT_PROXY_TEST_CONCURRENCY, probeChatgptProxy)
+    const passed = results.filter(item => item?.ok).length
+    const failed = results.length - passed
+
+    res.json({
+      total: results.length,
+      passed,
+      failed,
+      results
+    })
+  } catch (error) {
+    console.error('Test proxy-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 router.get('/upstream-settings', async (req, res) => {
   try {
     const db = await getDatabase()
     const settings = await getUpstreamSettings(db, { forceRefresh: true })
+    const publicBaseUrlSettings = await getPublicBaseUrlSettings(db, { forceRefresh: true })
+    const inboundClients = buildUpstreamInboundClientsResponse(settings)
 
     res.json({
       upstream: {
@@ -1122,8 +1443,12 @@ router.get('/upstream-settings', async (req, res) => {
         outboundApiKeyStored: Boolean(settings.stored?.outboundApiKey),
         apiEnabled: Boolean(settings.apiEnabled),
         apiEnabledStored: Boolean(settings.stored?.apiEnabled),
-        incomingApiKeySet: Boolean(String(settings.apiKey || '').trim()),
-        incomingApiKeyStored: Boolean(settings.stored?.apiKey)
+        publicBaseUrl: String(publicBaseUrlSettings.baseUrl || ''),
+        publicBaseUrlStored: Boolean(publicBaseUrlSettings.stored?.baseUrl),
+        inboundClients,
+        inboundClientsStored: Boolean(settings.stored?.inboundClients),
+        legacyIncomingApiKeySet: Boolean(String(settings.apiKey || '').trim()),
+        legacyIncomingApiKeyStored: Boolean(settings.stored?.apiKey),
       }
     })
   } catch (error) {
@@ -1138,14 +1463,26 @@ router.put('/upstream-settings', async (req, res) => {
     const db = await getDatabase()
 
     const current = await getUpstreamSettings(db, { forceRefresh: true })
+    const currentPublicBaseUrlSettings = await getPublicBaseUrlSettings(db, { forceRefresh: true })
     const env = getUpstreamSettingsFromEnv()
 
     const providerEnabled = parseBool(payload.providerEnabled ?? payload.provider_enabled, Boolean(current.providerEnabled))
     const providerType = normalizeUpstreamProviderType(payload.providerType ?? payload.provider_type, String(current.providerType || env.providerType || 'custom-http'))
     const supplierName = String(payload.supplierName ?? payload.supplier_name ?? current.supplierName ?? '').trim()
+    const publicBaseUrlInput = String(
+      payload.publicBaseUrl
+      ?? payload.public_base_url
+      ?? currentPublicBaseUrlSettings.baseUrl
+      ?? ''
+    ).trim()
     const hasBaseUrlInput = payload.baseUrl !== undefined || payload.base_url !== undefined
     const hasCustomUrlInput = payload.customUrl !== undefined || payload.custom_url !== undefined
     const hasCustomBodyTemplateInput = payload.customBodyTemplate !== undefined || payload.custom_body_template !== undefined
+
+    const publicBaseUrl = normalizePublicBaseUrl(publicBaseUrlInput)
+    if (publicBaseUrlInput && !publicBaseUrl) {
+      return res.status(400).json({ error: '公网 Base URL 必须是有效的 http(s) 地址' })
+    }
 
     const baseUrl = String(payload.baseUrl ?? payload.base_url ?? current.baseUrl ?? '').trim().replace(/\/+$/, '')
     const customUrl = String(payload.customUrl ?? payload.custom_url ?? current.customUrl ?? '').trim()
@@ -1220,6 +1557,12 @@ router.put('/upstream-settings', async (req, res) => {
 
     const apiEnabled = parseBool(payload.apiEnabled ?? payload.api_enabled, Boolean(current.apiEnabled))
 
+    const hasInboundClientsInput = payload.inboundClients !== undefined || payload.inbound_clients !== undefined
+    const rawInboundClients = payload.inboundClients ?? payload.inbound_clients
+    if (hasInboundClientsInput && !Array.isArray(rawInboundClients)) {
+      return res.status(400).json({ error: '入站 API Key 配置必须是数组' })
+    }
+
     const incomingApiKeyInput = typeof payload.incomingApiKey === 'string'
       ? payload.incomingApiKey.trim()
       : (typeof payload.incoming_api_key === 'string' ? payload.incoming_api_key.trim() : '')
@@ -1236,9 +1579,68 @@ router.put('/upstream-settings', async (req, res) => {
       }
     }
 
+    let inboundClientsToPersist = Array.isArray(current.inboundClients) ? current.inboundClients : []
+    if (hasInboundClientsInput) {
+      const currentInboundClientsById = new Map(
+        inboundClientsToPersist
+          .map(client => [String(client?.id || '').trim(), client])
+          .filter(([id]) => Boolean(id))
+      )
+      const normalizedClients = []
+      const seenDomains = new Set()
+
+      for (let index = 0; index < rawInboundClients.length; index += 1) {
+        const item = rawInboundClients[index]
+        if (!item || typeof item !== 'object') {
+          return res.status(400).json({ error: `第 ${index + 1} 条入站配置格式不正确` })
+        }
+
+        const inputId = String(item.id || '').trim()
+        const rawDomain = String(item.domain ?? item.downstreamDomain ?? item.downstream_domain ?? '').trim()
+        const domain = normalizeUpstreamPeerDomain(rawDomain)
+        if (rawDomain && !domain) {
+          return res.status(400).json({ error: `第 ${index + 1} 条入站配置的下游域名格式不正确` })
+        }
+        if (seenDomains.has(domain)) {
+          return res.status(400).json({ error: domain ? `下游域名重复：${domain}` : '默认入站规则只能保留一条' })
+        }
+        seenDomains.add(domain)
+
+        const keyInput = typeof item.apiKey === 'string'
+          ? item.apiKey.trim()
+          : (typeof item.api_key === 'string' ? item.api_key.trim() : '')
+
+        const matchedCurrent = inputId ? currentInboundClientsById.get(inputId) : null
+        const preservedLegacyKey = inputId === LEGACY_UPSTREAM_INBOUND_CLIENT_ID ? String(current.apiKey || '').trim() : ''
+        const effectiveApiKey = keyInput || String(matchedCurrent?.apiKey || '').trim() || preservedLegacyKey
+
+        if (!effectiveApiKey) {
+          return res.status(400).json({ error: domain ? `请为 ${domain} 填写入站 API Key` : '请为默认入站规则填写 API Key' })
+        }
+
+        normalizedClients.push({
+          id: inputId || crypto.randomUUID(),
+          domain,
+          apiKey: effectiveApiKey,
+        })
+      }
+
+      inboundClientsToPersist = normalizedClients
+      shouldUpsertIncomingApiKey = true
+      incomingApiKey = ''
+    }
+
+    if (apiEnabled && !hasInboundClientsInput && !incomingApiKey && inboundClientsToPersist.length === 0) {
+      return res.status(400).json({ error: '启用入站接口时必须至少配置一个入站 API Key' })
+    }
+    if (apiEnabled && hasInboundClientsInput && inboundClientsToPersist.length === 0) {
+      return res.status(400).json({ error: '启用入站接口时必须至少配置一个下游域名与 API Key' })
+    }
+
     upsertSystemConfigValue(db, 'upstream_provider_enabled', providerEnabled ? 'true' : 'false')
     upsertSystemConfigValue(db, 'upstream_provider_type', providerType)
     upsertSystemConfigValue(db, 'upstream_supplier_name', supplierName)
+    upsertSystemConfigValue(db, 'public_base_url', publicBaseUrl)
     upsertSystemConfigValue(db, 'upstream_base_url', baseUrl)
     upsertSystemConfigValue(db, 'upstream_custom_url', customUrl)
     upsertSystemConfigValue(db, 'upstream_custom_body_template', customBodyTemplate)
@@ -1247,14 +1649,20 @@ router.put('/upstream-settings', async (req, res) => {
     if (shouldUpsertOutboundApiKey) {
       upsertSystemConfigValue(db, 'upstream_outbound_api_key', outboundApiKey)
     }
-    if (shouldUpsertIncomingApiKey) {
+    if (hasInboundClientsInput) {
+      upsertSystemConfigValue(db, 'upstream_inbound_clients', stringifyUpstreamInboundClients(inboundClientsToPersist))
+      upsertSystemConfigValue(db, 'upstream_api_key', '')
+    } else if (shouldUpsertIncomingApiKey) {
       upsertSystemConfigValue(db, 'upstream_api_key', incomingApiKey)
     }
 
     saveDatabase()
     invalidateUpstreamSettingsCache()
+    invalidatePublicBaseUrlCache()
 
     const updated = await getUpstreamSettings(db, { forceRefresh: true })
+    const updatedPublicBaseUrlSettings = await getPublicBaseUrlSettings(db, { forceRefresh: true })
+    const inboundClients = buildUpstreamInboundClientsResponse(updated)
 
     res.json({
       upstream: {
@@ -1276,8 +1684,12 @@ router.put('/upstream-settings', async (req, res) => {
         outboundApiKeyStored: Boolean(updated.stored?.outboundApiKey),
         apiEnabled: Boolean(updated.apiEnabled),
         apiEnabledStored: Boolean(updated.stored?.apiEnabled),
-        incomingApiKeySet: Boolean(String(updated.apiKey || '').trim()),
-        incomingApiKeyStored: Boolean(updated.stored?.apiKey)
+        publicBaseUrl: String(updatedPublicBaseUrlSettings.baseUrl || ''),
+        publicBaseUrlStored: Boolean(updatedPublicBaseUrlSettings.stored?.baseUrl),
+        inboundClients,
+        inboundClientsStored: Boolean(updated.stored?.inboundClients),
+        legacyIncomingApiKeySet: Boolean(String(updated.apiKey || '').trim()),
+        legacyIncomingApiKeyStored: Boolean(updated.stored?.apiKey),
       }
     })
   } catch (error) {
@@ -3047,6 +3459,7 @@ router.get('/account-recovery/one-click/preview', async (req, res) => {
         FROM redemption_codes rc
         JOIN gpt_accounts ga ON lower(trim(ga.email)) = lower(trim(rc.account_email))
         WHERE rc.is_redeemed = 0
+          AND COALESCE(rc.is_downstream_sold, 0) = 0
           AND rc.account_email IS NOT NULL
           AND trim(rc.account_email) != ''
           AND COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
@@ -3475,11 +3888,13 @@ router.post('/account-recovery/recover', async (req, res) => {
           const recoveryAccountEmail = selectedRecovery.recoveryAccountEmail
 
           try {
-            const redemptionResult = await redeemCodeInternal({
-              code: recoveryCode,
-              email: redeemedBy,
-              channel: recoveryChannel
-            })
+            const redemptionResult = await withLocks(['purchase', `redemption-code:${recoveryCode}`], () => (
+              redeemCodeInternal({
+                code: recoveryCode,
+                email: redeemedBy,
+                channel: recoveryChannel
+              })
+            ))
 
             recordAccountRecovery(db, {
               email: redeemedBy,
@@ -3596,14 +4011,15 @@ router.post('/channels', async (req, res) => {
     const redeemMode = normalizeChannelRedeemMode(req.body?.redeemMode ?? req.body?.redeem_mode, 'code')
     let providerType = normalizeChannelProviderType(
       req.body?.providerType ?? req.body?.provider_type,
-      redeemMode === 'external-card' ? 'custom-http' : 'local'
+      redeemMode === 'external-card' ? 'platform-upstream' : 'local'
     )
     if (redeemMode !== 'external-card') {
       providerType = 'local'
     } else if (providerType === 'local') {
-      providerType = 'custom-http'
+      providerType = 'platform-upstream'
     }
     const allowCommonFallback = parseBoolean(req.body?.allowCommonFallback ?? req.body?.allow_common_fallback, false)
+    const allowDownstreamSale = parseBoolean(req.body?.allowDownstreamSale ?? req.body?.allow_downstream_sale, false)
     const isActive = parseBoolean(req.body?.isActive ?? req.body?.is_active, true)
     const sortOrder = Number.isFinite(Number(req.body?.sortOrder ?? req.body?.sort_order))
       ? Number(req.body?.sortOrder ?? req.body?.sort_order)
@@ -3618,10 +4034,10 @@ router.post('/channels', async (req, res) => {
     db.run(
       `
         INSERT INTO channels (
-          key, name, redeem_mode, provider_type, allow_common_fallback, is_active, is_builtin, sort_order, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+          key, name, redeem_mode, provider_type, allow_common_fallback, allow_downstream_sale, is_active, is_builtin, sort_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
       `,
-      [key, name, redeemMode, providerType, allowCommonFallback ? 1 : 0, isActive ? 1 : 0, sortOrder]
+      [key, name, redeemMode, providerType, allowCommonFallback ? 1 : 0, allowDownstreamSale ? 1 : 0, isActive ? 1 : 0, sortOrder]
     )
     saveDatabase()
     invalidateChannelsCache()
@@ -3644,7 +4060,7 @@ router.patch('/channels/:key', async (req, res) => {
     const db = await getDatabase()
     const existingResult = db.exec(
       `
-        SELECT key, name, redeem_mode, provider_type, allow_common_fallback, is_active, is_builtin, sort_order
+        SELECT key, name, redeem_mode, provider_type, allow_common_fallback, allow_downstream_sale, is_active, is_builtin, sort_order
         FROM channels
         WHERE key = ?
         LIMIT 1
@@ -3666,7 +4082,7 @@ router.patch('/channels/:key', async (req, res) => {
     if (nextRedeemMode !== 'external-card') {
       nextProviderType = 'local'
     } else if (nextProviderType === 'local') {
-      nextProviderType = 'custom-http'
+      nextProviderType = 'platform-upstream'
     }
     const updates = []
     const params = []
@@ -3696,6 +4112,12 @@ router.patch('/channels/:key', async (req, res) => {
       const allowCommonFallback = parseBoolean(req.body?.allowCommonFallback ?? req.body?.allow_common_fallback, false)
       updates.push('allow_common_fallback = ?')
       params.push(allowCommonFallback ? 1 : 0)
+    }
+
+    if (req.body?.allowDownstreamSale !== undefined || req.body?.allow_downstream_sale !== undefined) {
+      const allowDownstreamSale = parseBoolean(req.body?.allowDownstreamSale ?? req.body?.allow_downstream_sale, false)
+      updates.push('allow_downstream_sale = ?')
+      params.push(allowDownstreamSale ? 1 : 0)
     }
 
     if (req.body?.isActive !== undefined || req.body?.is_active !== undefined) {

@@ -57,6 +57,9 @@ const dateFormatOptions = computed(() => ({
 const showTextPopover = ref(false)
 const popoverText = ref('')
 const popoverPosition = ref({ x: 0, y: 0 })
+const showStatusTooltip = ref(false)
+const statusTooltipText = ref('')
+const statusTooltipPosition = ref({ x: 0, y: 0 })
 const runtimeChannels = ref<Channel[]>([])
 const channelOptions = ref<Array<{ value: string; label: string }>>([
   { value: 'common', label: '通用渠道' },
@@ -85,6 +88,7 @@ const showImportExternalDialog = ref(false)
 const importExternalChannel = ref('')
 const importExternalCodesText = ref('')
 const importingExternal = ref(false)
+const checkingUpstreamCodeIds = ref<number[]>([])
 let popoverTimer: ReturnType<typeof setTimeout> | null = null
 const { success: showSuccessToast, info: showInfoToast, warning: showWarningToast, error: showErrorToast } = useToast()
 
@@ -128,7 +132,12 @@ const normalizeSupplierStatus = (value?: string | null, fallback: string = 'pend
   return normalized || fallback
 }
 
+const isDownstreamSold = (code?: RedemptionCode | null) => Boolean(code?.isDownstreamSold)
+
 const getCodeStatusLabel = (code: RedemptionCode) => {
+  if (isDownstreamSold(code)) {
+    return '已下游售出'
+  }
   if (!isExternalCode(code)) {
     return code.isRedeemed ? '已使用' : '未使用'
   }
@@ -136,12 +145,16 @@ const getCodeStatusLabel = (code: RedemptionCode) => {
   const status = normalizeSupplierStatus(code.supplierStatus, code.isRedeemed ? 'success' : 'pending')
   if (status === 'processing') return '处理中'
   if (status === 'success') return '已履约'
+  if (status === 'used') return '已使用'
   if (status === 'invalid') return '已失效'
   if (status === 'failed') return '履约失败'
   return '待兑换'
 }
 
 const getCodeStatusClass = (code: RedemptionCode) => {
+  if (isDownstreamSold(code)) {
+    return 'bg-rose-50 text-rose-700 border-rose-200'
+  }
   if (!isExternalCode(code)) {
     return code.isRedeemed
       ? 'bg-gray-50 text-gray-500 border-gray-200'
@@ -151,6 +164,7 @@ const getCodeStatusClass = (code: RedemptionCode) => {
   const status = normalizeSupplierStatus(code.supplierStatus, code.isRedeemed ? 'success' : 'pending')
   if (status === 'processing') return 'bg-blue-50 text-blue-700 border-blue-200'
   if (status === 'success') return 'bg-emerald-50 text-emerald-700 border-emerald-200'
+  if (status === 'used') return 'bg-gray-50 text-gray-600 border-gray-200'
   if (status === 'invalid') return 'bg-red-50 text-red-700 border-red-200'
   if (status === 'failed') return 'bg-amber-50 text-amber-700 border-amber-200'
   return 'bg-slate-50 text-slate-600 border-slate-200'
@@ -161,11 +175,19 @@ const getSupplierSummary = (code?: RedemptionCode | null) => {
   return String(code.supplierName || code.supplierType || '').trim() || '上游供应商'
 }
 
+const canCheckUpstreamCode = (code: RedemptionCode) => {
+  if (isDownstreamSold(code)) return false
+  const channelConfig = getChannelConfig(code.channel)
+  if (!channelConfig) return false
+  return channelConfig.redeemMode === 'external-card' && String(channelConfig.providerType || '').trim().toLowerCase() === 'platform-upstream'
+}
+
 const canReinviteCode = (code: RedemptionCode) => code.isRedeemed && !isExternalCode(code)
 const canRedeemCode = (code: RedemptionCode) => {
+  if (isDownstreamSold(code)) return false
   if (code.isRedeemed) return false
   const supplierStatus = normalizeSupplierStatus(code.supplierStatus)
-  return supplierStatus !== 'invalid' && supplierStatus !== 'processing'
+  return supplierStatus !== 'invalid' && supplierStatus !== 'used' && supplierStatus !== 'processing'
 }
 const currentRedeemIsExternal = computed(() => isExternalCode(redeemTargetCode.value))
 const redeemDialogTitle = computed(() => currentRedeemIsExternal.value ? '执行上游兑换' : '发送兑换邀请')
@@ -227,6 +249,37 @@ const hideTextPopover = () => {
   }
 }
 
+const hideStatusTooltip = () => {
+  showStatusTooltip.value = false
+  statusTooltipText.value = ''
+}
+
+const handleStatusTooltipEnter = (code: RedemptionCode, event: MouseEvent) => {
+  const text = getCodeStatusTooltip(code)
+  if (!text) {
+    hideStatusTooltip()
+    return
+  }
+
+  const target = event.currentTarget as HTMLElement | null
+  if (target) {
+    const rect = target.getBoundingClientRect()
+    statusTooltipPosition.value = {
+      x: rect.left + rect.width / 2,
+      y: rect.top - 10,
+    }
+  } else {
+    const point = getEventPoint(event)
+    statusTooltipPosition.value = {
+      x: point.x,
+      y: point.y - 10,
+    }
+  }
+
+  statusTooltipText.value = text
+  showStatusTooltip.value = true
+}
+
 const getChannelLabel = (value?: string) => {
   const fallback = channelOptions.value[0]?.label || '通用渠道'
   if (!value) return fallback
@@ -274,7 +327,17 @@ const pageSize = ref(10)
 
 // 搜索和筛选状态
 const searchQuery = ref('')
-const statusFilter = ref<'全部' | '已使用' | '未使用'>('全部')
+const statusFilter = ref<'全部' | '已使用' | '未使用' | '已下游售出'>('全部')
+
+const getCodeStatusTooltip = (code: RedemptionCode) => {
+  if (isDownstreamSold(code) && code.downstreamSoldAt) {
+    return formatShanghaiDate(code.downstreamSoldAt, dateFormatOptions.value)
+  }
+  if (isExternalCode(code) && code.supplierResponseMessage) {
+    return code.supplierResponseMessage
+  }
+  return ''
+}
 
 // 计算总页数
 const totalPages = computed(() => Math.max(1, Math.ceil(totalCodes.value / pageSize.value)))
@@ -374,6 +437,7 @@ onMounted(async () => {
 
   if (typeof window !== 'undefined') {
     window.addEventListener('scroll', hideTextPopover, true)
+    window.addEventListener('scroll', hideStatusTooltip, true)
   }
 })
 
@@ -383,8 +447,10 @@ onUnmounted(() => {
 
 onBeforeUnmount(() => {
   hideTextPopover()
+  hideStatusTooltip()
   if (typeof window !== 'undefined') {
     window.removeEventListener('scroll', hideTextPopover, true)
+    window.removeEventListener('scroll', hideStatusTooltip, true)
   }
 })
 
@@ -413,7 +479,9 @@ const loadCodes = async () => {
       ? 'redeemed'
       : statusFilter.value === '未使用'
         ? 'unused'
-        : 'all'
+        : statusFilter.value === '已下游售出'
+          ? 'downstream_sold'
+          : 'all'
 
     const response = await redemptionCodeService.list({
       page: currentPage.value,
@@ -577,6 +645,19 @@ const handleDelete = async (id: number) => {
   }
 }
 
+const isCheckingUpstream = (id: number) => checkingUpstreamCodeIds.value.includes(id)
+
+const applyUpdatedCode = (updatedCode?: RedemptionCode | null) => {
+  if (!updatedCode) return
+  const index = codes.value.findIndex(item => item.id === updatedCode.id)
+  if (index === -1) return
+  codes.value[index] = {
+    ...codes.value[index],
+    ...updatedCode
+  }
+  codes.value = [...codes.value]
+}
+
 const isReinviting = (id: number) => reinvitingCodeIds.value.includes(id)
 const handleReinvite = async (code: RedemptionCode) => {
   if (!code.isRedeemed) {
@@ -594,6 +675,40 @@ const handleReinvite = async (code: RedemptionCode) => {
     showErrorToast(err.response?.data?.error || '重新邀请失败')
   } finally {
     reinvitingCodeIds.value = reinvitingCodeIds.value.filter(id => id !== code.id)
+  }
+}
+
+const handleCheckUpstreamCode = async (code: RedemptionCode) => {
+  if (!canCheckUpstreamCode(code)) {
+    showWarningToast('当前兑换码未配置平台通用接口检查')
+    return
+  }
+  if (isCheckingUpstream(code.id)) return
+
+  checkingUpstreamCodeIds.value = [...checkingUpstreamCodeIds.value, code.id]
+  try {
+    const result = await redemptionCodeService.checkUpstream(code.id)
+    applyUpdatedCode(result.code)
+
+    const status = String(result.result?.status || '').trim().toLowerCase()
+    const message = result.result?.message || result.message || '上游检查完成'
+    if (status === 'available') {
+      showSuccessToast(message)
+      return
+    }
+    if (status === 'used' || status === 'invalid') {
+      showWarningToast(message)
+      return
+    }
+    if (status === 'failed') {
+      showErrorToast(message)
+      return
+    }
+    showInfoToast(message)
+  } catch (err: any) {
+    showErrorToast(err.response?.data?.error || '上游检查失败')
+  } finally {
+    checkingUpstreamCodeIds.value = checkingUpstreamCodeIds.value.filter(id => id !== code.id)
   }
 }
 
@@ -1044,6 +1159,7 @@ const handleInviteSubmit = async () => {
             <SelectItem value="全部">全部状态</SelectItem>
             <SelectItem value="未使用">未使用</SelectItem>
             <SelectItem value="已使用">已使用</SelectItem>
+            <SelectItem value="已下游售出">已下游售出</SelectItem>
           </SelectContent>
         </Select>
       </div>
@@ -1139,49 +1255,49 @@ const handleInviteSubmit = async () => {
                     />
                  </td>
                 <td class="px-6 py-5">
-                  <div class="flex items-center gap-2">
-                    <span
-                       class="font-mono text-sm font-medium text-gray-900 bg-gray-100 px-2 py-1 rounded cursor-pointer hover:bg-gray-200 transition-colors"
-                       @click="copyToClipboard(code.code)"
-                    >
-                       {{ code.code }}
-                    </span>
-                    <span
-                        v-if="!code.isRedeemed && isCodeReserved(code)"
-                        class="rounded-full bg-orange-50 px-2 py-0.5 text-xs font-medium text-orange-600 border border-orange-200"
-                      >
-                        已绑定
-                      </span>
-                  </div>
-                  <p v-if="getSupplierSummary(code)" class="mt-1 text-xs text-gray-400">
-                    {{ getSupplierSummary(code) }}
-                  </p>
-                </td>
-                <td class="px-6 py-5 text-center">
-                  <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border"
-                    :class="getCodeStatusClass(code)"
+                  <span
+                     class="inline-flex font-mono text-sm font-medium text-gray-900 bg-gray-100 px-2 py-1 rounded cursor-pointer hover:bg-gray-200 transition-colors"
+                     @click="copyToClipboard(code.code)"
                   >
-                    {{ getCodeStatusLabel(code) }}
+                     {{ code.code }}
                   </span>
                 </td>
-                <td class="px-6 py-5">
-                   <Select
-                      :model-value="code.channel || 'common'"
-                      @update:modelValue="value => handleChannelChange(code, value)"
-                      :disabled="updatingChannelId === code.id"
+                <td class="px-6 py-5 text-center">
+                  <div class="flex flex-col items-center gap-1.5">
+                    <span
+                      class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border"
+                      :class="[getCodeStatusClass(code), getCodeStatusTooltip(code) ? 'cursor-help' : '']"
+                      @mouseenter="handleStatusTooltipEnter(code, $event)"
+                      @mouseleave="hideStatusTooltip"
                     >
-                      <SelectTrigger class="w-[140px] h-8 text-xs border-transparent bg-transparent hover:bg-white hover:border-gray-200 rounded-lg transition-all focus:ring-0">
-                        <SelectValue
-                          placeholder="选择渠道"
-                          :display-text="code.channelName || getChannelLabel(code.channel)"
-                        />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem v-for="option in channelOptions" :key="option.value" :value="option.value">
-                          {{ option.label }}
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
+                      {{ getCodeStatusLabel(code) }}
+                    </span>
+                    <span
+                      v-if="!code.isRedeemed && isCodeReserved(code)"
+                      class="rounded-full bg-orange-50 px-2 py-0.5 text-xs font-medium text-orange-600 border border-orange-200"
+                    >
+                      已绑定
+                    </span>
+                  </div>
+                </td>
+                <td class="px-6 py-5">
+                  <Select
+                     :model-value="code.channel || 'common'"
+                     @update:modelValue="value => handleChannelChange(code, value)"
+                     :disabled="updatingChannelId === code.id"
+                   >
+                     <SelectTrigger class="w-[140px] h-8 text-xs border-transparent bg-transparent hover:bg-white hover:border-gray-200 rounded-lg transition-all focus:ring-0">
+                       <SelectValue
+                         placeholder="选择渠道"
+                         :display-text="code.channelName || getChannelLabel(code.channel)"
+                       />
+                     </SelectTrigger>
+                     <SelectContent>
+                       <SelectItem v-for="option in channelOptions" :key="option.value" :value="option.value">
+                         {{ option.label }}
+                       </SelectItem>
+                     </SelectContent>
+                   </Select>
                 </td>
                 <td class="px-6 py-5">
                   <div class="flex items-center gap-2">
@@ -1230,6 +1346,17 @@ const handleInviteSubmit = async () => {
                 <td class="px-6 py-5 text-sm text-gray-500">{{ formatShanghaiDate(code.createdAt, dateFormatOptions).split(' ')[0] }}</td>
 	                <td class="px-6 py-5 text-right">
 	                  <div class="flex items-center justify-end gap-1">
+	                    <Button
+	                      v-if="canCheckUpstreamCode(code)"
+	                      size="icon"
+	                      variant="ghost"
+	                      class="h-8 w-8 text-gray-400 hover:text-sky-600 hover:bg-sky-50 rounded-lg"
+	                      @click="handleCheckUpstreamCode(code)"
+	                      :disabled="isCheckingUpstream(code.id)"
+	                      title="检查上游卡密"
+	                    >
+	                      <Search class="w-4 h-4" :class="isCheckingUpstream(code.id) ? 'animate-spin' : ''" />
+	                    </Button>
 	                    <!-- Reinvite -->
 	                    <Button
 	                      v-if="canReinviteCode(code)"
@@ -1275,31 +1402,33 @@ const handleInviteSubmit = async () => {
         <div class="md:hidden p-4 space-y-4 bg-gray-50/50">
           <div v-for="code in codes" :key="code.id" class="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
              <div class="flex items-start justify-between mb-4">
-                <div class="flex items-center gap-2">
+                <div>
                    <span 
-                      class="font-mono text-sm font-medium text-gray-900 bg-gray-100 px-2 py-1 rounded cursor-pointer active:bg-gray-200 transition-colors"
+                      class="inline-flex font-mono text-sm font-medium text-gray-900 bg-gray-100 px-2 py-1 rounded cursor-pointer active:bg-gray-200 transition-colors"
                       @click="copyToClipboard(code.code)"
                    >
                       {{ code.code }}
                    </span>
-                   <span
-                      v-if="!code.isRedeemed && isCodeReserved(code)"
-                      class="rounded-full bg-orange-50 px-2 py-0.5 text-xs font-medium text-orange-600 border border-orange-200"
-                   >
-                      已绑定
-                   </span>
                 </div>
-                <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold border"
-                   :class="getCodeStatusClass(code)"
-                >
-                   {{ getCodeStatusLabel(code) }}
-                </span>
+                <div class="flex flex-col items-end gap-1.5">
+                  <span
+                    class="inline-flex items-center px-2 py-1 rounded-full text-xs font-semibold border"
+                    :class="[getCodeStatusClass(code), getCodeStatusTooltip(code) ? 'cursor-help' : '']"
+                    @mouseenter="handleStatusTooltipEnter(code, $event)"
+                    @mouseleave="hideStatusTooltip"
+                  >
+                     {{ getCodeStatusLabel(code) }}
+                  </span>
+                  <span
+                    v-if="!code.isRedeemed && isCodeReserved(code)"
+                    class="rounded-full bg-orange-50 px-2 py-0.5 text-xs font-medium text-orange-600 border border-orange-200"
+                  >
+                    已绑定
+                  </span>
+                </div>
              </div>
 
              <div class="space-y-3 mb-4">
-                <div v-if="getSupplierSummary(code)" class="text-xs text-gray-400">
-                  {{ getSupplierSummary(code) }}
-                </div>
                 <div class="grid grid-cols-2 gap-4">
                    <div>
                       <p class="text-xs text-gray-400 mb-1">渠道</p>
@@ -1316,9 +1445,9 @@ const handleInviteSubmit = async () => {
                          <SelectContent>
                            <SelectItem v-for="option in channelOptions" :key="option.value" :value="option.value">
                              {{ option.label }}
-                           </SelectItem>
-                         </SelectContent>
-                       </Select>
+                         </SelectItem>
+                       </SelectContent>
+                     </Select>
                    </div>
                    <div>
                       <p class="text-xs text-gray-400 mb-1">所属账号</p>
@@ -1377,6 +1506,17 @@ const handleInviteSubmit = async () => {
              </div>
 
 	             <div class="flex items-center justify-end gap-2 pt-2 border-t border-gray-50">
+	                <Button
+	                   v-if="canCheckUpstreamCode(code)"
+	                   size="sm"
+	                   variant="outline"
+	                   class="h-9 text-xs border-sky-200 text-sky-600 hover:bg-sky-50"
+	                   @click="handleCheckUpstreamCode(code)"
+	                   :disabled="isCheckingUpstream(code.id)"
+	                >
+	                   <Search class="w-3.5 h-3.5 mr-1" :class="isCheckingUpstream(code.id) ? 'animate-spin' : ''" />
+	                   检查
+	                </Button>
 	                <Button
 	                   v-if="canReinviteCode(code)"
 	                   size="sm"
@@ -1796,6 +1936,19 @@ const handleInviteSubmit = async () => {
     >
       <p class="text-[10px] uppercase tracking-widest text-gray-400 mb-1">已复制</p>
       <p class="break-all leading-snug">{{ popoverText }}</p>
+    </div>
+
+    <div
+      v-if="showStatusTooltip"
+      class="fixed z-50 px-3 py-2 bg-gray-900/95 text-white rounded-lg pointer-events-none shadow-xl max-w-[280px] backdrop-blur-sm"
+      :style="{
+        top: `${statusTooltipPosition.y}px`,
+        left: `${statusTooltipPosition.x}px`,
+        transform: 'translate(-50%, -100%)'
+      }"
+    >
+      <p class="text-[10px] uppercase tracking-widest text-gray-400 mb-1">下游售出时间</p>
+      <p class="text-xs leading-snug whitespace-nowrap">{{ statusTooltipText }}</p>
     </div>
   </div>
 </template>

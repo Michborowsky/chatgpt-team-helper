@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { formatProxyForLog, loadProxyList, parseProxyConfig, pickProxyByHash } from '../utils/proxy.js'
+import { formatProxyForLog, loadDefaultProxyList, parseProxyConfig, pickProxyByHash } from '../utils/proxy.js'
 import { buildChatgptAdminHeaders, getAccountChatgptId, getAccountToken } from './account-client-profile.js'
 
 const DEFAULT_TIMEOUT_MS = 60000
@@ -78,9 +78,7 @@ async function getSocksAgent(proxyUrl) {
   return agent
 }
 
-const loadInviteProxyList = () => {
-  return loadProxyList()
-}
+const loadInviteProxyList = async () => loadDefaultProxyList()
 
 const pickProxySequence = (proxies = [], key) => {
   if (!proxies.length) return () => null
@@ -105,7 +103,7 @@ export async function inviteUserToChatGPTTeam(email, accountData, options = {}) 
   const chatgptAccountId = getAccountChatgptId(accountData)
 
   const proxyOverrides = options.proxy ? [buildProxyConfigFromUrl(options.proxy)].filter(Boolean) : []
-  const proxies = proxyOverrides.length ? proxyOverrides : loadInviteProxyList()
+  const proxies = proxyOverrides.length ? proxyOverrides : await loadInviteProxyList()
   const proxyKey = options.proxyKey ?? chatgptAccountId ?? ''
   const pickProxy = pickProxySequence(proxies, proxyKey)
 

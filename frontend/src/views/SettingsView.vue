@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
 import { authService, userService, adminService, versionService, purchaseService } from '@/services/api'
-import type { VersionInfo, LatestVersionInfo, Channel, PurchaseProduct, PurchaseMeta, PurchaseOrderType } from '@/services/api'
+import type { AdminProxyTestResult, VersionInfo, LatestVersionInfo, Channel, PurchaseProduct, PurchaseMeta, PurchaseOrderType } from '@/services/api'
 import { useAppConfigStore } from '@/stores/appConfig'
 import {
   Card,
@@ -30,17 +30,18 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import AnnouncementAdminPanel from '@/components/AnnouncementAdminPanel.vue'
 import InfoTooltip from '@/components/InfoTooltip.vue'
-import { Eye, EyeOff, Sparkles, KeyRound, AlertCircle, CheckCircle2, RefreshCw, Settings, CreditCard, Link, Mail, Shield } from 'lucide-vue-next'
+import { Eye, EyeOff, Sparkles, KeyRound, AlertCircle, CheckCircle2, RefreshCw, Settings, CreditCard, Link, Mail, Shield, Plus, Trash2 } from 'lucide-vue-next'
 
 const teleportReady = ref(false)
 const activeTab = ref<'settings' | 'announcements'>('settings')
-type SettingsModuleId = 'general' | 'billing' | 'integrations' | 'notifications' | 'security'
+type SettingsModuleId = 'general' | 'billing' | 'integrations' | 'upstream' | 'notifications' | 'security'
 type SettingsResourceKey =
   | 'apiKey'
   | 'featureFlags'
   | 'accountRecovery'
   | 'channels'
   | 'purchaseProducts'
+  | 'downstreamSale'
   | 'emailWhitelist'
   | 'pointsWithdraw'
   | 'smtp'
@@ -49,6 +50,7 @@ type SettingsResourceKey =
   | 'zpay'
   | 'turnstile'
   | 'telegram'
+  | 'proxy'
   | 'upstream'
 
 const settingsSubTab = ref<SettingsModuleId>('general')
@@ -57,8 +59,9 @@ const settingsNav = [
   { id: 'general', label: '基础设置', desc: '功能开关、白名单与补录', icon: Settings },
   { id: 'billing', label: '支付与财务', desc: '商品、支付通道与提现', icon: CreditCard },
   { id: 'integrations', label: '第三方集成', desc: 'OAuth、验证与机器人', icon: Link },
+  { id: 'upstream', label: '上下游接口配置', desc: '出站履约与入站鉴权', icon: RefreshCw },
   { id: 'notifications', label: '邮件与通知', desc: 'SMTP 告警邮件配置', icon: Mail },
-  { id: 'security', label: '核心与安全', desc: 'API 密钥与渠道管理', icon: Shield },
+  { id: 'security', label: '核心与安全', desc: 'API 密钥、渠道与网络', icon: Shield },
 ] as const
 
 const activeNavItem = computed(() => settingsNav.find(n => n.id === settingsSubTab.value))
@@ -68,6 +71,7 @@ const settingsResourceLoaded = ref<Record<SettingsResourceKey, boolean>>({
   accountRecovery: false,
   channels: false,
   purchaseProducts: false,
+  downstreamSale: false,
   emailWhitelist: false,
   pointsWithdraw: false,
   smtp: false,
@@ -76,6 +80,7 @@ const settingsResourceLoaded = ref<Record<SettingsResourceKey, boolean>>({
   zpay: false,
   turnstile: false,
   telegram: false,
+  proxy: false,
   upstream: false,
 })
 const settingsResourcePromises = new Map<SettingsResourceKey, Promise<void>>()
@@ -164,6 +169,7 @@ const channelFormName = ref('')
 const channelFormRedeemMode = ref('code')
 const channelFormProviderType = ref('local')
 const channelFormAllowFallback = ref(false)
+const channelFormAllowDownstreamSale = ref(false)
 const channelFormIsActive = ref(true)
 const channelFormSortOrder = ref('0')
 const channelRedeemModeOptions = [
@@ -264,6 +270,16 @@ const zpaySuccess = ref('')
 const zpayLoading = ref(false)
 const showZpayKey = ref(false)
 
+// 下游售码配置（仅超级管理员）
+const downstreamSaleEnabled = ref(false)
+const downstreamSaleProductName = ref('')
+const downstreamSaleAmount = ref('9.90')
+const downstreamSalePayAlipayEnabled = ref(true)
+const downstreamSalePayWxpayEnabled = ref(false)
+const downstreamSaleError = ref('')
+const downstreamSaleSuccess = ref('')
+const downstreamSaleLoading = ref(false)
+
 // Cloudflare Turnstile 配置（仅超级管理员）
 const turnstileSiteKey = ref('')
 const turnstileSecretKey = ref('')
@@ -293,7 +309,125 @@ const telegramSuccess = ref('')
 const telegramLoading = ref(false)
 const showTelegramBotToken = ref(false)
 
+// 全局代理配置（仅超级管理员）
+type ProxyRow = {
+  id: string
+  value: string
+}
+
+const createProxyRow = (value: string = ''): ProxyRow => ({
+  id: `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+  value,
+})
+
+const proxyStored = ref(false)
+const proxyEffectiveCount = ref(0)
+const proxyError = ref('')
+const proxySuccess = ref('')
+const proxyLoading = ref(false)
+const proxyTesting = ref(false)
+const proxyTestTotal = ref(0)
+const proxyTestPassed = ref(0)
+const proxyTestFailed = ref(0)
+const proxyTestResults = ref<AdminProxyTestResult[]>([])
+const proxyRows = ref<ProxyRow[]>([createProxyRow()])
+const proxyLastTestedProxyUrls = ref('')
+const parseProxyEntries = (value?: string | null) => (
+  String(value || '')
+    .split(/[\n,;]+/g)
+    .map(item => item.trim())
+    .filter(Boolean)
+)
+const buildProxyLookupKeys = (value?: string | null) => {
+  const raw = String(value || '').trim()
+  if (!raw) return []
+  const keys = new Set<string>([raw])
+  try {
+    const parsed = new URL(raw)
+    const protocol = String(parsed.protocol || '').replace(':', '').toLowerCase()
+    const auth = parsed.username
+      ? `${parsed.username}${parsed.password ? `:${parsed.password}` : ''}@`
+      : ''
+    const host = (parsed.hostname || '').toLowerCase()
+    const port = parsed.port ? `:${parsed.port}` : ''
+    const pathname = parsed.pathname && parsed.pathname !== '/' ? parsed.pathname : ''
+    const search = parsed.search || ''
+    const hash = parsed.hash || ''
+    keys.add(`${protocol}://${auth}${host}${port}${pathname}${search}${hash}`)
+    keys.add(`${protocol}://${host}${port}${pathname}${search}${hash}`)
+    keys.add(`${protocol}://${host}${port}`)
+  } catch {
+    return Array.from(keys)
+  }
+  return Array.from(keys)
+}
+const setProxyRowsFromText = (value?: string | null) => {
+  const entries = parseProxyEntries(value)
+  proxyRows.value = entries.length > 0
+    ? entries.map(entry => createProxyRow(entry))
+    : [createProxyRow()]
+}
+const proxyDraftProxyUrls = computed(() => (
+  proxyRows.value
+    .map(row => row.value.trim())
+    .filter(Boolean)
+    .join('\n')
+))
+const proxyDraftCount = computed(() => (
+  proxyRows.value.filter(row => row.value.trim()).length
+))
+const proxyResultLookup = computed(() => {
+  const lookup = new Map<string, AdminProxyTestResult>()
+  for (const result of proxyTestResults.value) {
+    for (const key of buildProxyLookupKeys(result.proxy)) {
+      lookup.set(key, result)
+    }
+  }
+  return lookup
+})
+const getProxyRowResult = (value?: string | null) => {
+  for (const key of buildProxyLookupKeys(value)) {
+    const result = proxyResultLookup.value.get(key)
+    if (result) return result
+  }
+  return null
+}
+const resetProxyTestState = () => {
+  proxyTestTotal.value = 0
+  proxyTestPassed.value = 0
+  proxyTestFailed.value = 0
+  proxyTestResults.value = []
+  proxyLastTestedProxyUrls.value = ''
+}
+const addProxyRow = () => {
+  proxyRows.value = [...proxyRows.value, createProxyRow()]
+}
+const removeProxyRow = (index: number) => {
+  if (proxyRows.value.length <= 1) {
+    proxyRows.value = [createProxyRow()]
+    return
+  }
+  proxyRows.value = proxyRows.value.filter((_, currentIndex) => currentIndex !== index)
+}
+
+watch(proxyDraftProxyUrls, (next, previous) => {
+  if (next === previous) return
+  if (next !== proxyLastTestedProxyUrls.value) {
+    resetProxyTestState()
+  }
+})
+
 // 上游履约配置（仅超级管理员）
+type UpstreamInboundClientRow = {
+  id: string
+  domain: string
+  apiKey: string
+  apiKeySet: boolean
+  apiKeyStored: boolean
+  legacy: boolean
+  showApiKey: boolean
+}
+
 const DEFAULT_UPSTREAM_CUSTOM_BODY_TEMPLATE = JSON.stringify({
   userEmail: '{{email}}',
   cardCode: '{{code}}'
@@ -310,20 +444,39 @@ const upstreamOutboundApiKey = ref('')
 const upstreamOutboundApiKeySet = ref(false)
 const upstreamOutboundApiKeyStored = ref(false)
 const upstreamApiEnabled = ref<'true' | 'false'>('false')
-const upstreamIncomingApiKey = ref('')
-const upstreamIncomingApiKeySet = ref(false)
-const upstreamIncomingApiKeyStored = ref(false)
+const upstreamPublicBaseUrl = ref('')
+const upstreamPublicBaseUrlStored = ref(false)
+const createUpstreamInboundClientRow = (overrides: Partial<UpstreamInboundClientRow> = {}): UpstreamInboundClientRow => ({
+  id: '',
+  domain: '',
+  apiKey: '',
+  apiKeySet: false,
+  apiKeyStored: false,
+  legacy: false,
+  showApiKey: false,
+  ...overrides,
+})
+const upstreamInboundClients = ref<UpstreamInboundClientRow[]>([createUpstreamInboundClientRow()])
 const upstreamError = ref('')
 const upstreamSuccess = ref('')
 const upstreamLoading = ref(false)
 const showUpstreamOutboundApiKey = ref(false)
-const showUpstreamIncomingApiKey = ref(false)
 const isCustomUpstreamProvider = computed(() => upstreamProviderType.value === 'custom-http')
 const isPlatformUpstreamProvider = computed(() => upstreamProviderType.value === 'platform-upstream')
 const upstreamPlaceholderHelp = '支持 {{email}}、{{code}}、{{channel}} 三个占位符。'
 const normalizeUpstreamProviderValue = (value?: string | null) => (
   value === 'platform-upstream' ? 'platform-upstream' : 'custom-http'
 )
+const normalizeUpstreamInboundDomain = (value?: string | null) => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (!raw || raw === '*' || raw === 'default') return ''
+  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`
+  try {
+    return new URL(candidate).hostname.trim().toLowerCase().replace(/\.+$/, '')
+  } catch {
+    return ''
+  }
+}
 const normalizeChannelProviderValue = (value?: string | null) => (
   value === 'platform-upstream' ? 'platform-upstream' : (value === 'local' ? 'local' : 'custom-http')
 )
@@ -401,7 +554,7 @@ watch(accountRecoveryForceTodayCodes, (next) => {
 watch(channelFormRedeemMode, (next) => {
   if (next === 'external-card') {
     if (channelFormProviderType.value === 'local') {
-      channelFormProviderType.value = 'custom-http'
+      channelFormProviderType.value = 'platform-upstream'
     }
     return
   }
@@ -476,6 +629,7 @@ const openCreateChannelDialog = () => {
   channelFormRedeemMode.value = 'code'
   channelFormProviderType.value = 'local'
   channelFormAllowFallback.value = false
+  channelFormAllowDownstreamSale.value = false
   channelFormIsActive.value = true
   channelFormSortOrder.value = '0'
   channelDialogOpen.value = true
@@ -487,9 +641,10 @@ const openEditChannelDialog = (channel: Channel) => {
   channelFormName.value = channel.name
   channelFormRedeemMode.value = channel.redeemMode === 'api' ? 'code' : (channel.redeemMode || 'code')
   channelFormProviderType.value = channel.redeemMode === 'external-card' && channel.providerType === 'local'
-    ? 'custom-http'
+    ? 'platform-upstream'
     : normalizeChannelProviderValue(channel.providerType)
   channelFormAllowFallback.value = Boolean(channel.allowCommonFallback)
+  channelFormAllowDownstreamSale.value = Boolean(channel.allowDownstreamSale)
   channelFormIsActive.value = Boolean(channel.isActive)
   channelFormSortOrder.value = String(channel.sortOrder ?? 0)
   channelDialogOpen.value = true
@@ -506,6 +661,7 @@ const submitChannelDialog = async () => {
         redeemMode: channelFormRedeemMode.value,
         providerType: channelFormProviderType.value,
         allowCommonFallback: channelFormAllowFallback.value,
+        allowDownstreamSale: channelFormAllowDownstreamSale.value,
         isActive: channelFormIsActive.value,
         sortOrder: Number.parseInt(channelFormSortOrder.value || '0', 10) || 0
       })
@@ -515,6 +671,7 @@ const submitChannelDialog = async () => {
         redeemMode: channelFormRedeemMode.value,
         providerType: channelFormProviderType.value,
         allowCommonFallback: channelFormAllowFallback.value,
+        allowDownstreamSale: channelFormAllowDownstreamSale.value,
         isActive: channelFormIsActive.value,
         sortOrder: Number.parseInt(channelFormSortOrder.value || '0', 10) || 0
       })
@@ -750,8 +907,22 @@ const toggleShowUpstreamOutboundApiKey = () => {
   showUpstreamOutboundApiKey.value = !showUpstreamOutboundApiKey.value
 }
 
-const toggleShowUpstreamIncomingApiKey = () => {
-  showUpstreamIncomingApiKey.value = !showUpstreamIncomingApiKey.value
+const toggleShowUpstreamInboundClientApiKey = (index: number) => {
+  const target = upstreamInboundClients.value[index]
+  if (!target) return
+  target.showApiKey = !target.showApiKey
+}
+
+const addUpstreamInboundClient = () => {
+  upstreamInboundClients.value = [...upstreamInboundClients.value, createUpstreamInboundClientRow()]
+}
+
+const removeUpstreamInboundClient = (index: number) => {
+  if (upstreamInboundClients.value.length === 1) {
+    upstreamInboundClients.value = [createUpstreamInboundClientRow()]
+    return
+  }
+  upstreamInboundClients.value = upstreamInboundClients.value.filter((_, currentIndex) => currentIndex !== index)
 }
 
 const loadEmailDomainWhitelist = async () => {
@@ -980,6 +1151,65 @@ const saveZpaySettings = async () => {
   }
 }
 
+const loadDownstreamSaleSettings = async () => {
+  downstreamSaleError.value = ''
+  downstreamSaleSuccess.value = ''
+  try {
+    const response = await adminService.getDownstreamSaleSettings()
+    downstreamSaleEnabled.value = Boolean(response.downstreamSale?.enabled)
+    downstreamSaleProductName.value = response.downstreamSale?.productName || ''
+    downstreamSaleAmount.value = response.downstreamSale?.amount || '9.90'
+    downstreamSalePayAlipayEnabled.value = response.downstreamSale?.payAlipayEnabled !== false
+    downstreamSalePayWxpayEnabled.value = Boolean(response.downstreamSale?.payWxpayEnabled)
+  } catch (err: any) {
+    downstreamSaleError.value = err.response?.data?.error || '加载下游售码配置失败'
+  }
+}
+
+const saveDownstreamSaleSettings = async () => {
+  downstreamSaleError.value = ''
+  downstreamSaleSuccess.value = ''
+
+  const productName = downstreamSaleProductName.value.trim()
+  const amount = downstreamSaleAmount.value.trim()
+  if (!productName) {
+    downstreamSaleError.value = '请输入下游售码商品名'
+    return
+  }
+  if (!amount) {
+    downstreamSaleError.value = '请输入下游统一售价'
+    return
+  }
+  if (!downstreamSalePayAlipayEnabled.value && !downstreamSalePayWxpayEnabled.value) {
+    downstreamSaleError.value = '支付宝和微信至少启用一个'
+    return
+  }
+
+  downstreamSaleLoading.value = true
+  try {
+    const response = await adminService.updateDownstreamSaleSettings({
+      downstreamSale: {
+        enabled: downstreamSaleEnabled.value,
+        productName,
+        amount,
+        payAlipayEnabled: downstreamSalePayAlipayEnabled.value,
+        payWxpayEnabled: downstreamSalePayWxpayEnabled.value,
+      }
+    })
+    downstreamSaleEnabled.value = Boolean(response.downstreamSale?.enabled)
+    downstreamSaleProductName.value = response.downstreamSale?.productName || productName
+    downstreamSaleAmount.value = response.downstreamSale?.amount || amount
+    downstreamSalePayAlipayEnabled.value = response.downstreamSale?.payAlipayEnabled !== false
+    downstreamSalePayWxpayEnabled.value = Boolean(response.downstreamSale?.payWxpayEnabled)
+    downstreamSaleSuccess.value = '已保存'
+    setTimeout(() => (downstreamSaleSuccess.value = ''), 3000)
+  } catch (err: any) {
+    downstreamSaleError.value = err.response?.data?.error || '保存失败'
+  } finally {
+    downstreamSaleLoading.value = false
+  }
+}
+
 const loadTurnstileSettings = async () => {
   turnstileError.value = ''
   turnstileSuccess.value = ''
@@ -1118,6 +1348,70 @@ const saveTelegramSettings = async () => {
   }
 }
 
+const loadProxySettings = async () => {
+  proxyError.value = ''
+  proxySuccess.value = ''
+  try {
+    const response = await adminService.getProxySettings()
+    setProxyRowsFromText(response.proxy?.proxyUrls || '')
+    proxyStored.value = Boolean(response.proxy?.stored)
+    proxyEffectiveCount.value = Number(response.proxy?.effectiveCount ?? 0)
+    resetProxyTestState()
+  } catch (err: any) {
+    proxyError.value = err.response?.data?.error || '加载代理配置失败'
+  }
+}
+
+const saveProxySettings = async () => {
+  proxyError.value = ''
+  proxySuccess.value = ''
+  proxyLoading.value = true
+  try {
+    const response = await adminService.updateProxySettings({
+      proxy: {
+        proxyUrls: proxyDraftProxyUrls.value,
+      }
+    })
+    setProxyRowsFromText(response.proxy?.proxyUrls || '')
+    proxyStored.value = Boolean(response.proxy?.stored)
+    proxyEffectiveCount.value = Number(response.proxy?.effectiveCount ?? 0)
+    resetProxyTestState()
+    proxySuccess.value = '已保存'
+    setTimeout(() => (proxySuccess.value = ''), 3000)
+  } catch (err: any) {
+    proxyError.value = err.response?.data?.error || '保存失败'
+  } finally {
+    proxyLoading.value = false
+  }
+}
+
+const testProxySettings = async () => {
+  proxyError.value = ''
+  if (!proxyDraftCount.value) {
+    proxyError.value = '请先填写至少一个代理'
+    resetProxyTestState()
+    return
+  }
+  proxyTesting.value = true
+  resetProxyTestState()
+  try {
+    const response = await adminService.testProxySettings({
+      proxy: {
+        proxyUrls: proxyDraftProxyUrls.value,
+      }
+    })
+    proxyTestTotal.value = Number(response.total ?? 0)
+    proxyTestPassed.value = Number(response.passed ?? 0)
+    proxyTestFailed.value = Number(response.failed ?? 0)
+    proxyTestResults.value = Array.isArray(response.results) ? response.results : []
+    proxyLastTestedProxyUrls.value = proxyDraftProxyUrls.value
+  } catch (err: any) {
+    proxyError.value = err.response?.data?.error || '测试失败'
+  } finally {
+    proxyTesting.value = false
+  }
+}
+
 const loadUpstreamSettings = async () => {
   upstreamError.value = ''
   upstreamSuccess.value = ''
@@ -1134,11 +1428,24 @@ const loadUpstreamSettings = async () => {
     upstreamOutboundApiKeySet.value = Boolean(response.upstream?.outboundApiKeySet)
     upstreamOutboundApiKeyStored.value = Boolean(response.upstream?.outboundApiKeyStored)
     upstreamApiEnabled.value = response.upstream?.apiEnabled ? 'true' : 'false'
-    upstreamIncomingApiKey.value = ''
-    upstreamIncomingApiKeySet.value = Boolean(response.upstream?.incomingApiKeySet)
-    upstreamIncomingApiKeyStored.value = Boolean(response.upstream?.incomingApiKeyStored)
+    upstreamPublicBaseUrl.value = response.upstream?.publicBaseUrl || ''
+    upstreamPublicBaseUrlStored.value = Boolean(response.upstream?.publicBaseUrlStored)
+    const inboundClients = Array.isArray(response.upstream?.inboundClients)
+      ? response.upstream.inboundClients
+      : []
+    upstreamInboundClients.value = inboundClients.length > 0
+      ? inboundClients.map(client => createUpstreamInboundClientRow({
+        id: client.id || '',
+        domain: client.domain || '',
+        apiKey: '',
+        apiKeySet: Boolean(client.apiKeySet),
+        apiKeyStored: Boolean(client.apiKeyStored),
+        legacy: Boolean(client.legacy),
+        showApiKey: false,
+      }))
+      : [createUpstreamInboundClientRow()]
   } catch (err: any) {
-    upstreamError.value = err.response?.data?.error || '加载上游配置失败'
+    upstreamError.value = err.response?.data?.error || '加载上下游接口配置失败'
   }
 }
 
@@ -1204,6 +1511,58 @@ const saveUpstreamSettings = async () => {
     return
   }
 
+  const publicBaseUrl = upstreamPublicBaseUrl.value.trim()
+  if (publicBaseUrl) {
+    try {
+      const parsed = new URL(publicBaseUrl)
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        upstreamError.value = '公网 Base URL 必须是 http(s)'
+        return
+      }
+    } catch {
+      upstreamError.value = '公网 Base URL 格式不正确'
+      return
+    }
+  }
+
+  const seenInboundDomains = new Set<string>()
+  const inboundClients: Array<{ id?: string; domain: string; apiKey?: string }> = []
+  for (let index = 0; index < upstreamInboundClients.value.length; index += 1) {
+    const client = upstreamInboundClients.value[index]
+    if (!client) continue
+    const rawDomain = client.domain.trim()
+    const normalizedDomain = normalizeUpstreamInboundDomain(rawDomain)
+    const apiKey = client.apiKey.trim()
+    const hasPersistedKey = client.apiKeySet
+    const isMeaningfulRow = Boolean(rawDomain || apiKey || hasPersistedKey || client.id)
+
+    if (!isMeaningfulRow) continue
+    if (rawDomain && !normalizedDomain) {
+      upstreamError.value = `第 ${index + 1} 条下游域名格式不正确`
+      return
+    }
+    if (seenInboundDomains.has(normalizedDomain)) {
+      upstreamError.value = normalizedDomain ? `下游域名重复：${normalizedDomain}` : '默认入站规则只能保留一条'
+      return
+    }
+    seenInboundDomains.add(normalizedDomain)
+    if (!apiKey && !hasPersistedKey) {
+      upstreamError.value = normalizedDomain ? `请为 ${normalizedDomain} 填写 API Key` : '请为默认入站规则填写 API Key'
+      return
+    }
+
+    inboundClients.push({
+      id: client.id || undefined,
+      domain: normalizedDomain,
+      apiKey: apiKey || undefined,
+    })
+  }
+
+  if (upstreamApiEnabled.value === 'true' && inboundClients.length === 0) {
+    upstreamError.value = '启用入站接口时，至少要配置一个下游域名与 API Key'
+    return
+  }
+
   upstreamLoading.value = true
   try {
     const payload: any = {
@@ -1212,7 +1571,9 @@ const saveUpstreamSettings = async () => {
         providerType,
         supplierName: upstreamSupplierName.value.trim(),
         timeoutMs,
-        apiEnabled: upstreamApiEnabled.value === 'true'
+        apiEnabled: upstreamApiEnabled.value === 'true',
+        publicBaseUrl,
+        inboundClients,
       }
     }
 
@@ -1229,10 +1590,6 @@ const saveUpstreamSettings = async () => {
     if (providerType === 'platform-upstream' && outboundKey) {
       payload.upstream.outboundApiKey = outboundKey
     }
-    const incomingKey = upstreamIncomingApiKey.value.trim()
-    if (incomingKey) {
-      payload.upstream.incomingApiKey = incomingKey
-    }
 
     const response = await adminService.updateUpstreamSettings(payload)
     upstreamProviderEnabled.value = response.upstream?.providerEnabled ? 'true' : 'false'
@@ -1246,9 +1603,22 @@ const saveUpstreamSettings = async () => {
     upstreamOutboundApiKeySet.value = Boolean(response.upstream?.outboundApiKeySet)
     upstreamOutboundApiKeyStored.value = Boolean(response.upstream?.outboundApiKeyStored)
     upstreamApiEnabled.value = response.upstream?.apiEnabled ? 'true' : 'false'
-    upstreamIncomingApiKey.value = ''
-    upstreamIncomingApiKeySet.value = Boolean(response.upstream?.incomingApiKeySet)
-    upstreamIncomingApiKeyStored.value = Boolean(response.upstream?.incomingApiKeyStored)
+    upstreamPublicBaseUrl.value = response.upstream?.publicBaseUrl || publicBaseUrl
+    upstreamPublicBaseUrlStored.value = Boolean(response.upstream?.publicBaseUrlStored)
+    const savedInboundClients = Array.isArray(response.upstream?.inboundClients)
+      ? response.upstream.inboundClients
+      : []
+    upstreamInboundClients.value = savedInboundClients.length > 0
+      ? savedInboundClients.map(client => createUpstreamInboundClientRow({
+        id: client.id || '',
+        domain: client.domain || '',
+        apiKey: '',
+        apiKeySet: Boolean(client.apiKeySet),
+        apiKeyStored: Boolean(client.apiKeyStored),
+        legacy: Boolean(client.legacy),
+        showApiKey: false,
+      }))
+      : [createUpstreamInboundClientRow()]
 
     upstreamSuccess.value = '已保存'
     setTimeout(() => (upstreamSuccess.value = ''), 3000)
@@ -1413,6 +1783,8 @@ const getSettingsResourceLoader = (resource: SettingsResourceKey) => {
       return loadChannels
     case 'purchaseProducts':
       return refreshPurchaseProducts
+    case 'downstreamSale':
+      return loadDownstreamSaleSettings
     case 'emailWhitelist':
       return loadEmailDomainWhitelist
     case 'pointsWithdraw':
@@ -1429,6 +1801,8 @@ const getSettingsResourceLoader = (resource: SettingsResourceKey) => {
       return loadTurnstileSettings
     case 'telegram':
       return loadTelegramSettings
+    case 'proxy':
+      return loadProxySettings
     case 'upstream':
       return loadUpstreamSettings
   }
@@ -1436,10 +1810,11 @@ const getSettingsResourceLoader = (resource: SettingsResourceKey) => {
 
 const settingsModuleResources: Record<SettingsModuleId, SettingsResourceKey[]> = {
   general: ['emailWhitelist', 'featureFlags', 'accountRecovery'],
-  billing: ['purchaseProducts', 'channels', 'zpay', 'pointsWithdraw'],
-  integrations: ['linuxdoOauth', 'linuxdoCredit', 'turnstile', 'telegram', 'upstream'],
+  billing: ['purchaseProducts', 'channels', 'downstreamSale', 'zpay', 'pointsWithdraw'],
+  integrations: ['linuxdoOauth', 'linuxdoCredit', 'turnstile', 'telegram'],
+  upstream: ['upstream'],
   notifications: ['smtp'],
-  security: ['apiKey', 'channels'],
+  security: ['apiKey', 'channels', 'proxy'],
 }
 
 const ensureSettingsResourceLoaded = async (
@@ -1918,7 +2293,7 @@ watch(activeTab, (next) => {
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">渠道管理</CardTitle>
           <CardDescription class="text-gray-500">
-            新增/停用渠道，并配置是否允许回退通用码；新增渠道默认使用通用兑换页（/redeem/&lt;key&gt;）。
+            新增/停用渠道，并配置是否允许回退通用码与参与下游售码库存；新增渠道默认使用通用兑换页（/redeem/&lt;key&gt;）。
           </CardDescription>
         </CardHeader>
         <CardContent class="p-6 sm:p-8 space-y-5 flex-1">
@@ -1947,6 +2322,7 @@ watch(activeTab, (next) => {
                   <th class="px-4 py-3 font-semibold">模式</th>
                   <th class="px-4 py-3 font-semibold">Provider</th>
                   <th class="px-4 py-3 font-semibold">回退通用码</th>
+                  <th class="px-4 py-3 font-semibold">下游售码</th>
                   <th class="px-4 py-3 font-semibold">状态</th>
                   <th class="px-4 py-3 font-semibold">兑换链接</th>
                   <th class="px-4 py-3 font-semibold text-right">操作</th>
@@ -1961,6 +2337,11 @@ watch(activeTab, (next) => {
                   <td class="px-4 py-3">
                     <span class="px-2 py-1 rounded-full text-xs font-medium" :class="channel.allowCommonFallback ? 'bg-green-50 text-green-700' : 'bg-gray-100 text-gray-600'">
                       {{ channel.allowCommonFallback ? '允许' : '不允许' }}
+                    </span>
+                  </td>
+                  <td class="px-4 py-3">
+                    <span class="px-2 py-1 rounded-full text-xs font-medium" :class="channel.allowDownstreamSale ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-600'">
+                      {{ channel.allowDownstreamSale ? '参与共享库存' : '不参与' }}
                     </span>
                   </td>
                   <td class="px-4 py-3">
@@ -1984,10 +2365,165 @@ watch(activeTab, (next) => {
                   </td>
                 </tr>
                 <tr v-if="!channels.length">
-                  <td colspan="8" class="px-4 py-6 text-center text-gray-400">暂无渠道数据</td>
+                  <td colspan="9" class="px-4 py-6 text-center text-gray-400">暂无渠道数据</td>
                 </tr>
               </tbody>
             </table>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
+        <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
+          <CardTitle class="text-xl font-bold text-gray-900">全局代理配置</CardTitle>
+          <!-- <CardDescription class="text-gray-500">统一配置 `OPEN_ACCOUNTS_SWEEPER_PROXY_URLS`，每个代理单独编辑，并在同一处逐个测试 chatgpt.com 连通性。</CardDescription> -->
+        </CardHeader>
+        <CardContent class="p-6 sm:p-8 space-y-6 flex-1">
+          <div class="rounded-2xl border border-gray-100 bg-gray-50/60 p-4">
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <!-- <div class="space-y-1">
+                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">OPEN_ACCOUNTS_SWEEPER_PROXY_URLS</Label>
+                <p class="text-sm text-gray-600">配置和连通性测试放在一起；保存写入系统设置，测试直接使用当前页面里的草稿。</p>
+              </div> -->
+              <div class="flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                <span class="rounded-full bg-white px-3 py-1.5 border border-gray-200">已填写 {{ proxyDraftCount }} 行</span>
+                <span class="rounded-full bg-white px-3 py-1.5 border border-gray-200">当前有效 {{ proxyEffectiveCount }} 条</span>
+                <!-- <span class="rounded-full bg-white px-3 py-1.5 border border-gray-200">{{ proxyStored ? '来源：系统设置' : '来源：环境变量回退或未配置' }}</span> -->
+              </div>
+            </div>
+          </div>
+
+          <div v-if="proxyError" class="rounded-xl bg-red-50 p-4 text-red-600 border border-red-100 text-sm font-medium">
+            {{ proxyError }}
+          </div>
+
+          <div v-if="proxySuccess" class="rounded-xl bg-green-50 p-4 text-green-600 border border-green-100 text-sm font-medium">
+            {{ proxySuccess }}
+          </div>
+
+          <div class="rounded-2xl border border-gray-100 bg-gray-50/60 p-4 space-y-4">
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <p class="text-sm font-semibold text-gray-900">代理列表</p>
+                <!-- <p class="text-xs text-gray-500">一行一个代理，可新增、删除；测试结果会直接贴在对应那一行。</p> -->
+              </div>
+              <div class="flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                <span class="rounded-full bg-white px-3 py-1.5 border border-gray-200">总数 {{ proxyTestTotal }}</span>
+                <span class="rounded-full bg-green-50 px-3 py-1.5 border border-green-100 text-green-700">通过 {{ proxyTestPassed }}</span>
+                <span class="rounded-full bg-red-50 px-3 py-1.5 border border-red-100 text-red-700">失败 {{ proxyTestFailed }}</span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  class="h-9 rounded-xl border-gray-200 bg-white px-3"
+                  :disabled="proxyLoading || proxyTesting"
+                  @click="addProxyRow"
+                >
+                  <Plus class="mr-2 h-4 w-4" />
+                  新增代理
+                </Button>
+              </div>
+            </div>
+
+            <div class="space-y-3">
+              <div
+                v-for="(row, index) in proxyRows"
+                :key="row.id"
+                class="rounded-2xl border border-gray-200 bg-white/90 p-4"
+              >
+                <div class="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                  <div
+                    class="min-w-0 flex-1 space-y-3"
+                  >
+                    <div class="flex flex-wrap items-center gap-2">
+                      <p class="font-medium text-gray-900">代理 {{ index + 1 }}</p>
+                      <template v-if="getProxyRowResult(row.value)">
+                        <span
+                          class="shrink-0 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium"
+                          :class="getProxyRowResult(row.value)?.ok ? 'bg-green-100 text-green-700' : (getProxyRowResult(row.value)?.reachable ? 'bg-orange-100 text-orange-700' : 'bg-red-100 text-red-700')"
+                        >
+                          {{ getProxyRowResult(row.value)?.ok ? '通过' : (getProxyRowResult(row.value)?.reachable ? '受限' : '失败') }}
+                        </span>
+                        <span class="text-xs text-gray-500">HTTP {{ getProxyRowResult(row.value)?.status || '-' }}</span>
+                        <span class="text-xs text-gray-500">{{ getProxyRowResult(row.value)?.durationMs }} ms</span>
+                      </template>
+                      <span
+                        v-else-if="proxyTesting && row.value.trim()"
+                        class="shrink-0 inline-flex items-center rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700"
+                      >
+                        测试中
+                      </span>
+                      <span
+                        v-else-if="row.value.trim()"
+                        class="shrink-0 inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-500"
+                      >
+                        未测试
+                      </span>
+                      <span
+                        v-else
+                        class="shrink-0 inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700"
+                      >
+                        待填写
+                      </span>
+                    </div>
+
+                    <Input
+                      v-model="row.value"
+                      type="text"
+                      placeholder="socks5h://127.0.0.1:1080 或 http://user:pass@127.0.0.1:8080"
+                      class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+                      :disabled="proxyLoading || proxyTesting"
+                    />
+
+                    <p v-if="getProxyRowResult(row.value)" class="text-xs break-all" :class="getProxyRowResult(row.value)?.ok ? 'text-green-700' : (getProxyRowResult(row.value)?.reachable ? 'text-orange-700' : 'text-red-700')">
+                      {{ getProxyRowResult(row.value)?.message }}
+                    </p>
+                    <!-- <p v-else class="text-xs text-gray-400">支持 `http`、`https`、`socks4`、`socks4a`、`socks5`、`socks5h`。</p> -->
+                    <p v-if="getProxyRowResult(row.value)?.bodySnippet" class="text-[12px] text-gray-500 break-all">
+                      {{ getProxyRowResult(row.value)?.bodySnippet }}
+                    </p>
+                  </div>
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    class="h-9 rounded-xl px-3 text-gray-600"
+                    :disabled="proxyLoading || proxyTesting"
+                    @click="removeProxyRow(index)"
+                  >
+                    <Trash2 class="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="flex flex-col sm:flex-row gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              class="w-full sm:w-auto h-11 rounded-xl"
+              :disabled="proxyLoading || proxyTesting"
+              @click="loadProxySettings"
+            >
+              刷新
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              class="w-full sm:w-auto h-11 rounded-xl border-gray-200"
+              :disabled="proxyLoading || proxyTesting"
+              @click="testProxySettings"
+            >
+              {{ proxyTesting ? '测试中...' : 'chatgpt.com连通性测试' }}
+            </Button>
+            <Button
+              type="button"
+              class="w-full sm:flex-1 h-11 rounded-xl bg-black hover:bg-gray-800 text-white shadow-lg shadow-black/5"
+              :disabled="proxyLoading || proxyTesting"
+              @click="saveProxySettings"
+            >
+              {{ proxyLoading ? '保存中...' : '保存代理配置' }}
+            </Button>
           </div>
         </CardContent>
       </Card>
@@ -2070,6 +2606,109 @@ watch(activeTab, (next) => {
                 </tr>
               </tbody>
             </table>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
+        <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
+          <CardTitle class="text-xl font-bold text-gray-900">下游售码配置</CardTitle>
+          <CardDescription class="text-gray-500">
+            下游公开页固定为 <span class="font-mono text-gray-700">/downstream</span>，库存自动复用所有开启“下游售码”的渠道共享库存。
+          </CardDescription>
+        </CardHeader>
+        <CardContent class="p-6 sm:p-8 space-y-6 flex-1">
+          <div class="flex items-center justify-between rounded-2xl border border-gray-100 bg-gray-50 p-4">
+            <div class="space-y-1">
+              <p class="font-medium text-gray-900">启用下游公开售码页</p>
+              <p class="text-xs text-gray-500">关闭后，/downstream 仅返回未启用状态，不再接受新下单。</p>
+            </div>
+            <input
+              v-model="downstreamSaleEnabled"
+              type="checkbox"
+              class="w-6 h-6 rounded-md border-gray-300 text-blue-600 focus:ring-blue-500"
+            />
+          </div>
+
+          <div class="grid gap-4 lg:grid-cols-2">
+            <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">商品名称</Label>
+              <Input
+                v-model="downstreamSaleProductName"
+                type="text"
+                placeholder="下游渠道兑换码"
+                class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all"
+                :disabled="downstreamSaleLoading"
+              />
+            </div>
+            <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">统一售价（元）</Label>
+              <Input
+                v-model="downstreamSaleAmount"
+                type="text"
+                placeholder="9.90"
+                class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono"
+                :disabled="downstreamSaleLoading"
+              />
+            </div>
+          </div>
+
+          <div class="grid gap-3 sm:grid-cols-2">
+            <label class="flex items-center justify-between rounded-2xl border border-gray-100 bg-gray-50 p-4">
+              <div class="space-y-1">
+                <p class="font-medium text-gray-900">支付宝</p>
+                <p class="text-xs text-gray-500">下游页展示支付宝支付</p>
+              </div>
+              <input
+                v-model="downstreamSalePayAlipayEnabled"
+                type="checkbox"
+                class="w-5 h-5 rounded-md border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+            </label>
+
+            <label class="flex items-center justify-between rounded-2xl border border-gray-100 bg-gray-50 p-4">
+              <div class="space-y-1">
+                <p class="font-medium text-gray-900">微信支付</p>
+                <p class="text-xs text-gray-500">下游页展示微信支付</p>
+              </div>
+              <input
+                v-model="downstreamSalePayWxpayEnabled"
+                type="checkbox"
+                class="w-5 h-5 rounded-md border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+            </label>
+          </div>
+
+          <div class="rounded-2xl border border-emerald-100 bg-emerald-50/70 p-4 text-sm text-emerald-900">
+            下游页会按这里的配置动态展示支付方式，支付宝和微信至少保留一个。
+          </div>
+
+          <div v-if="downstreamSaleError" class="rounded-xl bg-red-50 p-4 text-red-600 border border-red-100 text-sm font-medium">
+            {{ downstreamSaleError }}
+          </div>
+
+          <div v-if="downstreamSaleSuccess" class="rounded-xl bg-green-50 p-4 text-green-600 border border-green-100 text-sm font-medium">
+            {{ downstreamSaleSuccess }}
+          </div>
+
+          <div class="flex flex-col sm:flex-row gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              class="w-full sm:w-auto h-11 rounded-xl"
+              :disabled="downstreamSaleLoading"
+              @click="loadDownstreamSaleSettings"
+            >
+              刷新
+            </Button>
+            <Button
+              type="button"
+              class="w-full sm:flex-1 h-11 rounded-xl bg-black hover:bg-gray-800 text-white shadow-lg shadow-black/5"
+              :disabled="downstreamSaleLoading"
+              @click="saveDownstreamSaleSettings"
+            >
+              {{ downstreamSaleLoading ? '保存中...' : '保存下游售码配置' }}
+            </Button>
           </div>
         </CardContent>
       </Card>
@@ -2370,12 +3009,29 @@ watch(activeTab, (next) => {
         </CardContent>
       </Card>
 
+      </template>
+
+      <template v-if="settingsSubTab === 'upstream'">
       <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
-          <CardTitle class="text-xl font-bold text-gray-900">上游接口配置</CardTitle>
-          <CardDescription class="text-gray-500">出站用于把卡密提交到外部系统，入站用于让其他平台通过标准接口调用当前平台。</CardDescription>
+          <CardTitle class="text-xl font-bold text-gray-900">上下游接口配置</CardTitle>
+          <CardDescription class="text-gray-500">出站用于把卡密提交到上游平台，入站用于让不同下游实例通过标准接口调用当前平台；下游映射码也走这套入站接口。</CardDescription>
         </CardHeader>
         <CardContent class="p-6 sm:p-8 space-y-6 flex-1">
+          <div class="rounded-2xl border border-gray-200 bg-gray-50/70 p-4 space-y-3">
+            <div class="flex items-center gap-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">本站域名</Label>
+              <InfoTooltip content="保存后会同时用于平台通用接口出站时自动携带下游域名，以及支付/开放账号相关回调地址生成。留空则继续按请求或环境变量自动推导。" width-class="w-96" />
+            </div>
+            <Input
+              v-model="upstreamPublicBaseUrl"
+              type="text"
+              placeholder="https://example.com"
+              class="h-11 bg-white border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+              :disabled="upstreamLoading"
+            />
+          </div>
+
           <Tabs v-model="upstreamConfigTab" class="space-y-6">
             <div class="rounded-2xl border border-gray-200 bg-gray-50/80 p-2">
               <TabsList class="grid h-auto w-full grid-cols-2 gap-2 bg-transparent p-0">
@@ -2390,7 +3046,6 @@ watch(activeTab, (next) => {
                   <div class="mt-0.5 h-2.5 w-2.5 rounded-full bg-blue-500"></div>
                   <div class="space-y-1">
                     <p class="font-semibold">出站履约会在兑换或支付成功后触发。</p>
-                    <p class="text-blue-800/80">如果这里没配完整，外部卡密商品不会再进入可售流程，避免出现先付款后履约失败。</p>
                   </div>
                 </div>
               </div>
@@ -2555,62 +3210,121 @@ watch(activeTab, (next) => {
                   <div class="mt-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500"></div>
                   <div class="space-y-1">
                     <p class="font-semibold">入站接口会把当前平台暴露成标准供应方。</p>
-                    <p class="text-emerald-800/80">其他平台可以用固定路径请求你的卡密查询与兑换能力，适合做平台间上下游。</p>
+                    <p class="text-emerald-800/80">其他平台可以用固定路径请求你的卡密查询与兑换能力；真实兑换码和下游映射码都可以通过这里入站对接。</p>
                   </div>
                 </div>
               </div>
 
-              <div class="grid gap-4 lg:grid-cols-2">
-                <div class="space-y-2">
-                  <div class="flex items-center gap-2">
-                    <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">入站接口开关</Label>
-                    <InfoTooltip content="启用后，外部平台可通过标准路径请求当前平台的健康检查、卡密校验和卡密兑换接口。" width-class="w-80" />
+              <div class="space-y-2">
+                <div class="flex items-center gap-2">
+                  <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">入站接口开关</Label>
+                  <InfoTooltip content="启用后，外部平台可通过标准路径请求当前平台的健康检查、卡密校验和卡密兑换接口。" width-class="w-80" />
+                </div>
+                <Select v-model="upstreamApiEnabled" :disabled="upstreamLoading">
+                  <SelectTrigger class="h-11 bg-gray-50 border-gray-200 rounded-xl">
+                    <SelectValue placeholder="选择状态" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="true">启用</SelectItem>
+                    <SelectItem value="false">禁用</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div class="space-y-4">
+                <div class="flex items-center justify-between gap-3">
+                  <div>
+                    <p class="text-sm font-semibold text-gray-900">下游域名与入站 API Key</p>
+                    <p class="text-xs text-gray-500">建议每个下游实例单独分配一条规则，域名按主机名精确匹配。</p>
                   </div>
-                  <Select v-model="upstreamApiEnabled" :disabled="upstreamLoading">
-                    <SelectTrigger class="h-11 bg-gray-50 border-gray-200 rounded-xl">
-                      <SelectValue placeholder="选择状态" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="true">启用</SelectItem>
-                      <SelectItem value="false">禁用</SelectItem>
-                    </SelectContent>
-                  </Select>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    class="h-10 rounded-xl"
+                    :disabled="upstreamLoading"
+                    @click="addUpstreamInboundClient"
+                  >
+                    <Plus class="mr-2 h-4 w-4" />
+                    新增规则
+                  </Button>
                 </div>
 
-                <div class="space-y-2">
-                  <div class="flex items-center gap-2">
-                    <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">入站 API Key</Label>
-                    <InfoTooltip content="请求方需要在请求头携带 X-Upstream-Key。建议为每个合作方生成独立密钥。" width-class="w-72" />
-                  </div>
-                  <div class="relative">
-                    <Input
-                      v-model="upstreamIncomingApiKey"
-                      :type="showUpstreamIncomingApiKey ? 'text' : 'password'"
-                      placeholder="留空表示不修改"
-                      class="h-11 pr-10 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
-                      :disabled="upstreamLoading"
-                    />
-                    <button
+                <div
+                  v-for="(client, index) in upstreamInboundClients"
+                  :key="client.id || `upstream-inbound-${index}`"
+                  class="rounded-2xl border border-gray-200 bg-gray-50/70 p-4 space-y-4"
+                >
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="space-y-1">
+                      <p class="font-medium text-gray-900">下游规则 {{ index + 1 }}</p>
+                      <p class="text-xs text-gray-500">
+                        <template v-if="client.legacy">这是旧单 API Key 自动迁移出来的默认规则，保存后会转成新的多域名配置。</template>
+                        <template v-else>域名支持填写 `partner.example.com` 或完整 URL，保存时会自动规范化成主机名。</template>
+                      </p>
+                    </div>
+                    <Button
                       type="button"
-                      @click="toggleShowUpstreamIncomingApiKey"
-                      class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 transition-colors"
+                      variant="outline"
+                      class="h-9 rounded-xl px-3 text-gray-600"
+                      :disabled="upstreamLoading"
+                      @click="removeUpstreamInboundClient(index)"
                     >
-                      <EyeOff v-if="showUpstreamIncomingApiKey" class="h-4 w-4" />
-                      <Eye v-else class="h-4 w-4" />
-                    </button>
+                      <Trash2 class="h-4 w-4" />
+                    </Button>
                   </div>
-                  <p class="text-xs text-gray-400">
-                    <template v-if="upstreamIncomingApiKeyStored">已入库；留空表示不修改。</template>
-                    <template v-else-if="upstreamIncomingApiKeySet">当前值可用但未入库；保存时会迁移或覆盖。</template>
-                    <template v-else>未设置。</template>
-                  </p>
+
+                  <div class="grid gap-4 lg:grid-cols-2">
+                    <div class="space-y-2">
+                      <div class="flex items-center gap-2">
+                        <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">下游域名</Label>
+                        <InfoTooltip content="填写下游实例自己的访问域名。留空表示默认规则，会匹配所有没有单独配置的下游。" width-class="w-80" />
+                      </div>
+                      <Input
+                        v-model="client.domain"
+                        type="text"
+                        placeholder="partner.example.com"
+                        class="h-11 bg-white border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+                        :disabled="upstreamLoading"
+                      />
+                      <p class="text-xs text-gray-400">留空表示默认规则；推荐优先为每个下游实例填写唯一域名。</p>
+                    </div>
+
+                    <div class="space-y-2">
+                      <div class="flex items-center gap-2">
+                        <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">入站 API Key</Label>
+                        <InfoTooltip content="请求方需要在请求头携带 X-Upstream-Key。每个下游建议生成独立密钥，便于单独轮换与停用。" width-class="w-80" />
+                      </div>
+                      <div class="relative">
+                        <Input
+                          v-model="client.apiKey"
+                          :type="client.showApiKey ? 'text' : 'password'"
+                          placeholder="留空表示不修改"
+                          class="h-11 pr-10 bg-white border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+                          :disabled="upstreamLoading"
+                        />
+                        <button
+                          type="button"
+                          @click="toggleShowUpstreamInboundClientApiKey(index)"
+                          class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 transition-colors"
+                        >
+                          <EyeOff v-if="client.showApiKey" class="h-4 w-4" />
+                          <Eye v-else class="h-4 w-4" />
+                        </button>
+                      </div>
+                      <p class="text-xs text-gray-400">
+                        <template v-if="client.apiKeyStored">已入库；留空表示不修改。</template>
+                        <template v-else-if="client.apiKeySet">当前值可用但未入库；保存时会迁移或覆盖。</template>
+                        <template v-else>未设置。</template>
+                      </p>
+                    </div>
+                  </div>
                 </div>
               </div>
 
               <div class="rounded-2xl border border-gray-200 bg-gray-50/70 p-4 text-sm text-gray-600">
                 <div class="flex items-center gap-2">
                   <p class="font-medium text-gray-900">固定入站路径</p>
-                  <InfoTooltip content="这三条路径由平台统一维护，外部对接方只需要按标准路径接入即可。" width-class="w-72" />
+                  <InfoTooltip content="这三条路径由平台统一维护，外部对接方只需要按标准路径接入即可；下游映射码也直接走这里。" width-class="w-72" />
                 </div>
                 <div class="mt-3 grid gap-2 md:grid-cols-3">
                   <code class="rounded-lg bg-white px-3 py-2 text-xs text-gray-700 shadow-sm">GET /api/upstream/health</code>
@@ -2645,7 +3359,7 @@ watch(activeTab, (next) => {
               :disabled="upstreamLoading"
               @click="saveUpstreamSettings"
             >
-              {{ upstreamLoading ? '保存中...' : '保存上游接口配置' }}
+              {{ upstreamLoading ? '保存中...' : '保存上下游接口配置' }}
             </Button>
           </div>
         </CardContent>
@@ -2947,6 +3661,7 @@ watch(activeTab, (next) => {
           </div>
         </CardContent>
       </Card>
+
       </template>
 
       <template v-if="settingsSubTab === 'billing'">
@@ -3079,6 +3794,13 @@ watch(activeTab, (next) => {
                 <p class="text-xs text-gray-500">开启后可在该渠道入口使用通用渠道兑换码。</p>
               </div>
               <input type="checkbox" v-model="channelFormAllowFallback" class="w-6 h-6 rounded-md border-gray-300 text-blue-600 focus:ring-blue-500" />
+            </div>
+            <div class="flex items-center justify-between p-4 bg-gray-50 rounded-2xl border border-gray-100">
+              <div class="space-y-1">
+                <p class="font-medium text-gray-900">允许参与下游售码</p>
+                <p class="text-xs text-gray-500">开启后，该渠道下可售兑换码会进入 /downstream 共享库存。</p>
+              </div>
+              <input type="checkbox" v-model="channelFormAllowDownstreamSale" class="w-6 h-6 rounded-md border-gray-300 text-blue-600 focus:ring-blue-500" />
             </div>
             <div class="flex items-center justify-between p-4 bg-gray-50 rounded-2xl border border-gray-100">
               <div class="space-y-1">

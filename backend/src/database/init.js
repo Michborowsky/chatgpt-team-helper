@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url'
 import { dirname } from 'path'
 import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
+import { generateDownstreamPublicCode } from '../utils/downstream-order-items.js'
 
 const CHANNEL_LABELS = {
   common: '通用渠道',
@@ -24,6 +25,7 @@ const BUILTIN_CHANNELS = [
     redeemMode: 'code',
     providerType: 'local',
     allowCommonFallback: 0,
+    allowDownstreamSale: 0,
     isActive: 1,
     isBuiltin: 1,
     sortOrder: 10
@@ -34,6 +36,7 @@ const BUILTIN_CHANNELS = [
     redeemMode: 'code',
     providerType: 'local',
     allowCommonFallback: 0,
+    allowDownstreamSale: 0,
     isActive: 1,
     isBuiltin: 0,
     sortOrder: 20
@@ -44,6 +47,7 @@ const BUILTIN_CHANNELS = [
     redeemMode: 'linux-do',
     providerType: 'local',
     allowCommonFallback: 0,
+    allowDownstreamSale: 0,
     isActive: 1,
     isBuiltin: 1,
     sortOrder: 30
@@ -54,6 +58,7 @@ const BUILTIN_CHANNELS = [
     redeemMode: 'xhs',
     providerType: 'local',
     allowCommonFallback: 1,
+    allowDownstreamSale: 0,
     isActive: 1,
     isBuiltin: 1,
     sortOrder: 40
@@ -64,6 +69,7 @@ const BUILTIN_CHANNELS = [
     redeemMode: 'xianyu',
     providerType: 'local',
     allowCommonFallback: 1,
+    allowDownstreamSale: 0,
     isActive: 1,
     isBuiltin: 1,
     sortOrder: 50
@@ -74,6 +80,7 @@ const BUILTIN_CHANNELS = [
     redeemMode: 'code',
     providerType: 'local',
     allowCommonFallback: 0,
+    allowDownstreamSale: 0,
     isActive: 1,
     isBuiltin: 0,
     sortOrder: 60
@@ -82,8 +89,9 @@ const BUILTIN_CHANNELS = [
     key: 'external-card',
     name: CHANNEL_LABELS['external-card'],
     redeemMode: 'external-card',
-    providerType: 'custom-http',
+    providerType: 'platform-upstream',
     allowCommonFallback: 0,
+    allowDownstreamSale: 0,
     isActive: 1,
     isBuiltin: 1,
     sortOrder: 70
@@ -564,11 +572,12 @@ const migrateUtcTimestampsToLocaltime = (database) => {
     { table: 'system_config', columns: ['updated_at'] },
     { table: 'gpt_accounts', columns: ['created_at', 'updated_at'] },
     { table: 'linuxdo_users', columns: ['created_at', 'updated_at'] },
-    { table: 'redemption_codes', columns: ['created_at', 'updated_at', 'redeemed_at', 'reserved_at'] },
+    { table: 'redemption_codes', columns: ['created_at', 'updated_at', 'redeemed_at', 'reserved_at', 'downstream_sold_at'] },
     { table: 'waiting_room_entries', columns: ['created_at', 'updated_at', 'reserved_at', 'boarded_at', 'left_at'] },
     { table: 'waiting_room_cooldown_resets', columns: ['reset_at'] },
     { table: 'account_recovery_logs', columns: ['created_at', 'updated_at', 'original_redeemed_at'] },
     { table: 'purchase_orders', columns: ['created_at', 'updated_at', 'query_at', 'paid_at', 'redeemed_at', 'refunded_at', 'email_sent_at', 'telegram_sent_at'] },
+    { table: 'downstream_order_items', columns: ['redeemed_at', 'created_at', 'updated_at'] },
     { table: 'credit_orders', columns: ['created_at', 'updated_at', 'query_at', 'paid_at', 'notify_at', 'refunded_at'] },
     { table: 'xhs_config', columns: ['updated_at', 'last_sync_at', 'last_success_at'] },
     { table: 'xhs_orders', columns: ['extracted_at', 'reserved_at', 'used_at', 'created_at', 'updated_at'] },
@@ -789,6 +798,12 @@ const ensureCoreIndexes = (database) => {
     database,
     'idx_redemption_codes_unredeemed_created_at',
     'CREATE INDEX IF NOT EXISTS idx_redemption_codes_unredeemed_created_at ON redemption_codes (is_redeemed, created_at)'
+  ) || changed
+
+  changed = ensureIndex(
+    database,
+    'idx_redemption_codes_downstream_sold_created_at',
+    'CREATE INDEX IF NOT EXISTS idx_redemption_codes_downstream_sold_created_at ON redemption_codes (is_downstream_sold, is_redeemed, created_at)'
   ) || changed
 
   changed = ensureIndex(
@@ -1241,6 +1256,7 @@ const ensureChannelsTable = (database) => {
           redeem_mode TEXT NOT NULL DEFAULT 'code',
           provider_type TEXT NOT NULL DEFAULT 'local',
           allow_common_fallback INTEGER DEFAULT 0,
+          allow_downstream_sale INTEGER DEFAULT 0,
           is_active INTEGER DEFAULT 1,
           is_builtin INTEGER DEFAULT 0,
           sort_order INTEGER DEFAULT 0,
@@ -1263,6 +1279,7 @@ const ensureChannelsTable = (database) => {
       addColumn('redeem_mode', "redeem_mode TEXT NOT NULL DEFAULT 'code'")
       addColumn('provider_type', "provider_type TEXT NOT NULL DEFAULT 'local'")
       addColumn('allow_common_fallback', 'allow_common_fallback INTEGER DEFAULT 0')
+      addColumn('allow_downstream_sale', 'allow_downstream_sale INTEGER DEFAULT 0')
       addColumn('is_active', 'is_active INTEGER DEFAULT 1')
       addColumn('is_builtin', 'is_builtin INTEGER DEFAULT 0')
       addColumn('sort_order', 'sort_order INTEGER DEFAULT 0')
@@ -1272,6 +1289,7 @@ const ensureChannelsTable = (database) => {
 
     database.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_key ON channels(key)')
     database.run('CREATE INDEX IF NOT EXISTS idx_channels_active_sort ON channels(is_active, sort_order, id)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_channels_downstream_active_sort ON channels(allow_downstream_sale, is_active, sort_order, id)')
   } catch (error) {
     console.warn('[DB] 无法初始化 channels 表:', error)
   }
@@ -1289,8 +1307,10 @@ const ensureChannelsTable = (database) => {
       if (existing[0]?.values?.length) continue
       database.run(
         `
-          INSERT INTO channels (key, name, redeem_mode, provider_type, allow_common_fallback, is_active, is_builtin, sort_order, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+          INSERT INTO channels (
+            key, name, redeem_mode, provider_type, allow_common_fallback, allow_downstream_sale, is_active, is_builtin, sort_order, created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
         `,
         [
           channel.key,
@@ -1298,6 +1318,7 @@ const ensureChannelsTable = (database) => {
           channel.redeemMode,
           channel.providerType || 'local',
           Number(channel.allowCommonFallback) ? 1 : 0,
+          Number(channel.allowDownstreamSale) ? 1 : 0,
           Number(channel.isActive) ? 1 : 0,
           Number(channel.isBuiltin) ? 1 : 0,
           Number.isFinite(Number(channel.sortOrder)) ? Number(channel.sortOrder) : 0
@@ -1579,6 +1600,8 @@ const ensurePurchaseOrdersTable = (database) => {
           amount TEXT NOT NULL,
           service_days INTEGER DEFAULT 30,
           order_type TEXT DEFAULT 'warranty',
+          order_scene TEXT DEFAULT 'retail',
+          quantity INTEGER DEFAULT 1,
           product_key TEXT,
           code_channel TEXT,
           pay_type TEXT,
@@ -1635,6 +1658,8 @@ const ensurePurchaseOrdersTable = (database) => {
         addColumn('amount', 'amount TEXT')
         addColumn('service_days', 'service_days INTEGER DEFAULT 30')
         addColumn('order_type', "order_type TEXT DEFAULT 'warranty'")
+        addColumn('order_scene', "order_scene TEXT DEFAULT 'retail'")
+        addColumn('quantity', 'quantity INTEGER DEFAULT 1')
         addColumn('product_key', 'product_key TEXT')
         addColumn('code_channel', 'code_channel TEXT')
         addColumn('pay_type', 'pay_type TEXT')
@@ -1674,6 +1699,7 @@ const ensurePurchaseOrdersTable = (database) => {
   database.run('CREATE INDEX IF NOT EXISTS idx_purchase_orders_status_created ON purchase_orders(status, created_at)')
   database.run('CREATE INDEX IF NOT EXISTS idx_purchase_orders_email_created ON purchase_orders(email, created_at)')
   database.run('CREATE INDEX IF NOT EXISTS idx_purchase_orders_user_created ON purchase_orders(user_id, created_at)')
+  database.run('CREATE INDEX IF NOT EXISTS idx_purchase_orders_scene_created ON purchase_orders(order_scene, created_at)')
   database.run('CREATE INDEX IF NOT EXISTS idx_purchase_orders_product_created ON purchase_orders(product_key, created_at)')
   database.run('CREATE INDEX IF NOT EXISTS idx_purchase_orders_code_channel_created ON purchase_orders(code_channel, created_at)')
   changed = ensureIndex(
@@ -1689,6 +1715,20 @@ const ensurePurchaseOrdersTable = (database) => {
 
   try {
     // Backfill for older orders (best-effort).
+    database.run(
+      `
+        UPDATE purchase_orders
+        SET order_scene = COALESCE(NULLIF(TRIM(order_scene), ''), 'retail')
+        WHERE order_scene IS NULL OR TRIM(order_scene) = ''
+      `
+    )
+    database.run(
+      `
+        UPDATE purchase_orders
+        SET quantity = 1
+        WHERE quantity IS NULL OR quantity <= 0
+      `
+    )
     database.run(
       `
         UPDATE purchase_orders
@@ -1711,6 +1751,142 @@ const ensurePurchaseOrdersTable = (database) => {
     )
   } catch (error) {
     console.warn('[DB] 无法回填 purchase_orders.product_key/code_channel:', error)
+  }
+
+  return changed
+}
+
+const ensureDownstreamOrderItemsTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    const downstreamItemsExists = database.exec('SELECT name FROM sqlite_master WHERE type="table" AND name="downstream_order_items"')
+    if (downstreamItemsExists.length === 0) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS downstream_order_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_no TEXT NOT NULL,
+          code_id INTEGER NOT NULL,
+          public_code TEXT NOT NULL UNIQUE,
+          redeem_email TEXT,
+          redeemed_at DATETIME,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          updated_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          FOREIGN KEY (order_no) REFERENCES purchase_orders(order_no),
+          FOREIGN KEY (code_id) REFERENCES redemption_codes(id)
+        )
+      `)
+      changed = true
+    } else {
+      const tableInfo = database.exec('PRAGMA table_info(downstream_order_items)')
+      if (tableInfo.length > 0) {
+        const columns = tableInfo[0].values.map(row => row[1])
+        const addColumn = (name, ddl) => {
+          if (!columns.includes(name)) {
+            database.run(`ALTER TABLE downstream_order_items ADD COLUMN ${ddl}`)
+            changed = true
+          }
+        }
+
+        addColumn('order_no', 'order_no TEXT')
+        addColumn('code_id', 'code_id INTEGER')
+        addColumn('public_code', 'public_code TEXT')
+        addColumn('redeem_email', 'redeem_email TEXT')
+        addColumn('redeemed_at', 'redeemed_at DATETIME')
+        addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+        addColumn('updated_at', "updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+      }
+    }
+  } catch (error) {
+    console.warn('[DB] 无法初始化 downstream_order_items 表:', error)
+  }
+
+  changed = ensureIndex(
+    database,
+    'idx_downstream_order_items_order_no',
+    'CREATE INDEX IF NOT EXISTS idx_downstream_order_items_order_no ON downstream_order_items(order_no)'
+  ) || changed
+  changed = ensureIndex(
+    database,
+    'idx_downstream_order_items_code_id',
+    'CREATE INDEX IF NOT EXISTS idx_downstream_order_items_code_id ON downstream_order_items(code_id)'
+  ) || changed
+  changed = ensureIndex(
+    database,
+    'idx_downstream_order_items_public_code',
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_downstream_order_items_public_code ON downstream_order_items(public_code)'
+  ) || changed
+  changed = ensureIndex(
+    database,
+    'idx_downstream_order_items_order_code_unique',
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_downstream_order_items_order_code_unique ON downstream_order_items(order_no, code_id)'
+  ) || changed
+
+  try {
+    database.run(
+      `
+        UPDATE purchase_orders
+        SET quantity = 1
+        WHERE quantity IS NULL OR quantity <= 0
+      `
+    )
+
+    const legacyOrders = database.exec(
+      `
+        SELECT po.order_no,
+               po.code_id,
+               po.redeem_account_email,
+               po.redeemed_at,
+               po.paid_at
+        FROM purchase_orders po
+        LEFT JOIN downstream_order_items doi
+          ON doi.order_no = po.order_no
+         AND doi.code_id = po.code_id
+        WHERE COALESCE(NULLIF(TRIM(po.order_scene), ''), 'retail') = 'downstream'
+          AND po.code_id IS NOT NULL
+          AND COALESCE(po.quantity, 1) = 1
+          AND (po.status IN ('paid', 'refunded') OR po.paid_at IS NOT NULL OR po.refunded_at IS NOT NULL)
+          AND doi.id IS NULL
+        ORDER BY po.created_at ASC, po.id ASC
+      `
+    )
+
+      const rows = legacyOrders[0]?.values || []
+      for (const row of rows) {
+        const orderNo = row[0] ? String(row[0]).trim() : ''
+        const codeId = Number(row[1] || 0)
+        if (!orderNo || !codeId) continue
+
+        database.run(
+          `
+            UPDATE redemption_codes
+            SET is_downstream_sold = 1,
+                downstream_sold_at = COALESCE(downstream_sold_at, COALESCE(?, DATETIME('now', 'localtime'))),
+                updated_at = DATETIME('now', 'localtime')
+            WHERE id = ?
+          `,
+          [row[4] || null, codeId]
+        )
+
+        database.run(
+          `
+          INSERT INTO downstream_order_items (
+            order_no, code_id, public_code, redeem_email, redeemed_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+        `,
+          [
+            orderNo,
+            codeId,
+            generateDownstreamPublicCode(database),
+            row[2] ? String(row[2]).trim() : null,
+            row[3] || null
+          ]
+        )
+        changed = true
+      }
+  } catch (error) {
+    console.warn('[DB] 无法回填 downstream_order_items:', error)
   }
 
   return changed
@@ -2066,6 +2242,7 @@ export async function initDatabase() {
         const linuxDoUsersCreated = ensureLinuxDoUsersTable(database)
         const accountRecoveryCreated = ensureAccountRecoveryTable(database)
         const purchaseOrdersCreated = ensurePurchaseOrdersTable(database)
+        const downstreamOrderItemsCreated = ensureDownstreamOrderItemsTable(database)
         const creditOrdersCreated = ensureCreditOrdersTable(database)
         const channelsCreated = ensureChannelsTable(database)
         const purchaseProductsCreated = ensurePurchaseProductsTable(database)
@@ -2073,7 +2250,7 @@ export async function initDatabase() {
         const pointsLedgerCreated = ensurePointsLedgerTable(database)
         const announcementsCreated = ensureAnnouncementsTables(database)
         const rbacInitialized = ensureRbacTables(database)
-        if (waitingRoomCreated || xhsTablesCreated || xianyuTablesCreated || linuxDoUsersCreated || accountRecoveryCreated || purchaseOrdersCreated || creditOrdersCreated || channelsCreated || purchaseProductsCreated || pointsWithdrawalsCreated || pointsLedgerCreated || announcementsCreated || rbacInitialized) {
+        if (waitingRoomCreated || xhsTablesCreated || xianyuTablesCreated || linuxDoUsersCreated || accountRecoveryCreated || purchaseOrdersCreated || downstreamOrderItemsCreated || creditOrdersCreated || channelsCreated || purchaseProductsCreated || pointsWithdrawalsCreated || pointsLedgerCreated || announcementsCreated || rbacInitialized) {
           saveDatabase()
         }
 
@@ -2235,6 +2412,18 @@ export async function initDatabase() {
               saveDatabase()
             }
 
+            if (!redemptionColumns.includes('is_downstream_sold')) {
+              database.run("ALTER TABLE redemption_codes ADD COLUMN is_downstream_sold INTEGER DEFAULT 0")
+              console.log('已添加 is_downstream_sold 列到 redemption_codes 表')
+              saveDatabase()
+            }
+
+            if (!redemptionColumns.includes('downstream_sold_at')) {
+              database.run('ALTER TABLE redemption_codes ADD COLUMN downstream_sold_at DATETIME')
+              console.log('已添加 downstream_sold_at 列到 redemption_codes 表')
+              saveDatabase()
+            }
+
             if (!redemptionColumns.includes('fulfillment_mode')) {
               database.run("ALTER TABLE redemption_codes ADD COLUMN fulfillment_mode TEXT DEFAULT 'internal_invite'")
               console.log('已添加 fulfillment_mode 列到 redemption_codes 表')
@@ -2296,6 +2485,9 @@ export async function initDatabase() {
             database.run(
               `UPDATE redemption_codes SET channel_name = ? WHERE channel_name IS NULL OR channel_name = ''`,
               [DEFAULT_CHANNEL_NAME],
+            )
+            database.run(
+              `UPDATE redemption_codes SET is_downstream_sold = 0 WHERE is_downstream_sold IS NULL`
             )
             database.run(
               `UPDATE redemption_codes SET order_type = 'warranty' WHERE order_type IS NULL OR order_type = ''`
@@ -2396,6 +2588,8 @@ export async function initDatabase() {
       channel TEXT DEFAULT '${DEFAULT_CHANNEL}',
       channel_name TEXT DEFAULT '${DEFAULT_CHANNEL_NAME}',
       order_type TEXT DEFAULT 'warranty',
+      is_downstream_sold INTEGER DEFAULT 0,
+      downstream_sold_at DATETIME,
       fulfillment_mode TEXT DEFAULT 'internal_invite',
       supplier_name TEXT,
       supplier_type TEXT,
@@ -2421,16 +2615,17 @@ export async function initDatabase() {
 	  const waitingRoomInitialized = ensureWaitingRoomTable(database)
 	  const xhsTablesInitialized = ensureXhsTables(database)
 	  const xianyuTablesInitialized = ensureXianyuTables(database)
-	  const linuxDoUsersInitialized = ensureLinuxDoUsersTable(database)
+  const linuxDoUsersInitialized = ensureLinuxDoUsersTable(database)
   const accountRecoveryInitialized = ensureAccountRecoveryTable(database)
   const purchaseOrdersInitialized = ensurePurchaseOrdersTable(database)
+  const downstreamOrderItemsInitialized = ensureDownstreamOrderItemsTable(database)
   const creditOrdersInitialized = ensureCreditOrdersTable(database)
   const channelsInitialized = ensureChannelsTable(database)
   const purchaseProductsInitialized = ensurePurchaseProductsTable(database)
   const pointsWithdrawalsInitialized = ensurePointsWithdrawalsTable(database)
   const pointsLedgerInitialized = ensurePointsLedgerTable(database)
   const announcementsInitialized = ensureAnnouncementsTables(database)
-  if (waitingRoomInitialized || xhsTablesInitialized || xianyuTablesInitialized || linuxDoUsersInitialized || accountRecoveryInitialized || purchaseOrdersInitialized || creditOrdersInitialized || channelsInitialized || purchaseProductsInitialized || pointsWithdrawalsInitialized || pointsLedgerInitialized || announcementsInitialized) {
+  if (waitingRoomInitialized || xhsTablesInitialized || xianyuTablesInitialized || linuxDoUsersInitialized || accountRecoveryInitialized || purchaseOrdersInitialized || downstreamOrderItemsInitialized || creditOrdersInitialized || channelsInitialized || purchaseProductsInitialized || pointsWithdrawalsInitialized || pointsLedgerInitialized || announcementsInitialized) {
     saveDatabase()
   }
 
