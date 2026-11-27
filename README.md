@@ -557,3 +557,10 @@ lsof -ti:5173 | xargs kill -9
 ## License
 
 ISC
+
+
+## Platform Notes
+Behaviour can vary between Linux, macOS and Windows.
+Platform-specific bugs should include OS details in reports.
+## License
+[![License-MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
