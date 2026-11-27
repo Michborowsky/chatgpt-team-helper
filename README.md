@@ -564,3 +564,24 @@ Behaviour can vary between Linux, macOS and Windows.
 Platform-specific bugs should include OS details in reports.
 ## License
 [![License-MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+
+## Caching
+
+chatgpt-team-helper uses a multi-level cache strategy.
+
+### L1 — Process-local
+- Caffeine: `maximumSize=1000`, `expireAfterWrite=60s`
+- For hot config lookups that rarely change
+
+### L2 — Distributed
+- Redis: shared across instances
+- TTL = 300s by default
+- Cache key format: `chatgpt-team-helper:{entity}:{id}`
+
+### Invalidation
+- Write-through: on update, L2 evicted + event published
+- Subscribers evict their local L1 on receive
+
+### Observability
+Cache hit/miss exposed as Micrometer metrics.
